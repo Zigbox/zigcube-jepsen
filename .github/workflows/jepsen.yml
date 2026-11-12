@@ -1,0 +1,84 @@
+name: jepsen
+
+on:
+  push:
+    branches: [main, claude/harness]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      time_limit:
+        description: Seconds of load and faults
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  register-pg:
+    name: register / postgres / partitions + failover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      LEIN_VERSION: "2.11.2"
+      TIME_LIMIT: ${{ inputs.time_limit || '120' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: lein-${{ env.LEIN_VERSION }}-${{ hashFiles('project.clj') }}
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p bin
+          curl -fsSL -o bin/lein "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein"
+          chmod +x bin/lein
+          bin/lein version
+
+      - name: Fetch dependencies
+        run: bin/lein deps
+
+      - name: Start 5 nodes
+        run: docker/up.sh
+
+      - name: Probe fault primitives
+        run: docker/check-faults.sh
+
+      - name: Run register test
+        run: |
+          bin/lein run test \
+            --ssh-private-key docker/.ssh/id_ed25519 \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency 10 \
+            --min-failovers 2 > jepsen-stdout.log 2>&1 && rc=0 || rc=$?
+          # The full log is in the artifact; show the nemesis trace and verdict.
+          grep -E 'jepsen.util :nemesis' jepsen-stdout.log | cut -c1-220 || true
+          tail -n 25 jepsen-stdout.log
+          exit "$rc"
+
+      - name: Upload store
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-store
+          path: |
+            store/
+            jepsen-stdout.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Node logs on failure
+        if: failure()
+        run: for i in 1 2 3 4 5; do echo "== n$i"; docker logs "n$i" 2>&1 | tail -n 20; done
