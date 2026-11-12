@@ -4,7 +4,7 @@ FROM ${BASE}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       openssh-server sudo iptables iproute2 iputils-ping procps psmisc \
-      faketime libfaketime postgresql-16 ca-certificates curl tcpdump \
+      faketime libfaketime postgresql-16 libpq5 libsqlite3-0 ca-certificates curl tcpdump \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
     && echo 'root:root' | chpasswd \

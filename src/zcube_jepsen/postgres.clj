@@ -28,7 +28,8 @@
        "max_wal_senders = 10\n"
        "hot_standby = on\n"
        "wal_keep_size = '256MB'\n"
-       "synchronous_commit = on\n"
+       ; Zigcube's supported setup (docs/operations.md).
+       "synchronous_commit = remote_apply\n"
        "synchronous_standby_names = '*'\n"
        "max_connections = 200\n"))
 
@@ -91,22 +92,26 @@
     {:retry-interval 500 :log-interval 5000 :timeout 90000
      :log-message "waiting for synchronous standby"}))
 
+(defn setup-node!
+  "Sets up Postgres on this node if it is one of the pair."
+  [test node]
+  (let [[primary standby] (pg-nodes test)]
+    (condp = node
+      primary (do (wipe!)
+                  (init-primary!)
+                  (await-sync-standby! primary)
+                  ; Created here, once, rather than by racing clients.
+                  (pg! :psql :-U :jepsen :-d :jepsen :-v "ON_ERROR_STOP=1" :-c
+                       (str "CREATE TABLE registers "
+                            "(k bigint PRIMARY KEY, v bigint NOT NULL)")))
+      standby (do (await-primary! primary) (seed-standby! primary))
+      nil)))
+
 (defn db
-  "Postgres on the first two nodes; the others are left empty in this slice."
+  "Postgres on the first two nodes; the others are left empty."
   []
   (reify db/DB
-    (setup! [_ test node]
-      (let [[primary standby] (pg-nodes test)]
-        (condp = node
-          primary (do (wipe!)
-                      (init-primary!)
-                      (await-sync-standby! primary)
-                      ; Created here, once, rather than by racing clients.
-                      (pg! :psql :-U :jepsen :-d :jepsen :-v "ON_ERROR_STOP=1" :-c
-                           (str "CREATE TABLE registers "
-                                "(k bigint PRIMARY KEY, v bigint NOT NULL)")))
-          standby (do (await-primary! primary) (seed-standby! primary))
-          nil)))
+    (setup! [_ test node] (setup-node! test node))
     (teardown! [_ test node]
       (when (some #{node} (pg-nodes test))
         (wipe!)))
@@ -123,8 +128,9 @@
              standby. Until this succeeds, commits on the new primary block.
 
   `state` is an atom {:primary node, :standby node, :standby-up? bool,
-  :failovers n}."
-  [state]
+  :failovers n}. `on-promote`, if given, is called with the test and the new
+  primary after each promotion (to repoint whatever names the primary)."
+  [state on-promote]
   (reify nemesis/Nemesis
     (setup! [this test]
       (let [[p s] (pg-nodes test)]
@@ -139,6 +145,7 @@
             (do (c/on-nodes test [primary] (fn [_ _] (kill!)))
                 (c/on-nodes test [standby]
                             (fn [_ _] (pg! :pg_ctl :-D data-dir :-w :-t 60 :promote)))
+                (when on-promote (on-promote test standby))
                 (swap! state #(-> %
                                   (assoc :primary standby :standby primary
                                          :standby-up? false)

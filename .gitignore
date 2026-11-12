@@ -5,3 +5,4 @@
 /bin/lein
 *.log
 /docker/.ssh/
+/zigcube
