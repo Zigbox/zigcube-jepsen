@@ -10,30 +10,69 @@ Zigcube's `docs/authority.md` and job documentation.
 > must be filled in from the issues before slices 3 to 5 are built. Items
 > marked **(to confirm)** are assumptions.
 
-## Slice 1b: remainder
+## Slice 1b: remainder (done on `claude/jepsen-1b`, CI to confirm)
 
-Done: CI builds Zigcube at a pinned commit; `zcube-server` on `n3`, agents on
-`n4`, `n5`; the register goes through `POST /v1/apply` and `GET /v1/list`; the
-Postgres-only test is a second job. Left:
+Done before: CI builds Zigcube at a pinned commit; `zcube-server` on `n3`,
+agents on `n4`, `n5`; the register goes through `POST /v1/apply` and
+`GET /v1/list`; the Postgres-only test is a second job. Then:
 
-1. **Partitions that cut clients off.** Clients run on the control host,
-   which no partition includes. Run them inside the cluster, or add the
-   control host to the grudge.
-2. **A compare-and-set op.** The API has none, so the model is a plain
-   register. `/v1/list` returns `mod_revision`; a read that carries it turns
-   the history into a versioned register, which Elle can check more cheaply
-   and more precisely than Knossos.
-3. **Unfenced failover.** Promote the standby while the old primary is alive
-   behind a partition and the server still points at it. `docs/operations.md`
-   says the server remembers the highest revision in `--state-dir` and halts
-   with ZC-E0215 on a store that went backwards; this is the run that tests
-   it. With `synchronous_commit = remote_apply` the old primary cannot
-   acknowledge a write alone, so the expected result is stalls, not loss.
-4. **Negative control.** A run expected to fail (asynchronous standby, which
-   Zigcube documents as unsupported, plus failover), to show the checker
-   catches a real loss here.
-5. **Measure the outage.** The server reconnects to the new primary without
-   a restart (seen in CI). Report how long writes fail per failover.
+1. **Partitions that cut clients off.** Done: `nemesis.clj`. The control
+   host is a member of every partition: it lands on one half at random, and
+   the nodes of the other half drop its traffic to the client ports (5432,
+   7070). SSH stays open, as Jepsen's control plane.
+   `--no-client-partition` restores the old behaviour.
+2. **A versioned register checked with Elle.** Done: `checkers.clj`. Every
+   `:ok` op carries `:version` (api: `mod_revision` from `/v1/list`, and the
+   apply answer's `revision`; pg: a per-row counter). A final `:store-read`
+   reads the store straight from the current primary. The history becomes
+   an Elle list-append history (a read at version n reads every value up to
+   n), checked for strict serializability; a version seen with two values,
+   or a value at two versions, fails the check as well. Knossos stays on as
+   a cross-check. The API still has no compare-and-set, so the api model
+   stays a plain register; pg cas ops now use unique values too.
+3. **Unfenced failover.** Done: `--failover unfenced`. The pair is cut
+   apart, the standby promoted with the old primary alive, and clients (and
+   `zcube-server`) repointed only after `--repoint-delay-ms` (5 s). The
+   verdict allows a ZC-E0215 halt only in this mode, and even then the store
+   read must hold every acknowledged write (Elle) and Knossos must pass.
+   Local pg run: valid, no halt (pg has no server to halt).
+4. **Negative control.** Done: `--replication async --failover lagged
+   --expect lost-write`. The standby is asynchronous and cut off for
+   `--lag-ms` (4 s) before a fenced promotion, so writes acknowledged in
+   that window are lost. The run is valid only if it is not vacuous and
+   Knossos, Elle or a ZC-E0215 halt caught the loss. Local pg run: caught
+   by both Knossos and Elle (G-single-item, G0-realtime, G1c,
+   incompatible-order; versions re-used for two values).
+5. **Measure the outage.** Done: the `:outage` checker. Per failover, ms
+   from its start to the first acknowledgement of a write issued after it
+   started, the longest stretch with no write acknowledged, and when the
+   promotion and the rejoin finished. Local pg numbers: fenced 4.3 to
+   4.7 s; unfenced 9.3 s for the failover whose writes were in flight.
+   With `synchronous_standby_names = '*'`, the promoted primary cannot
+   commit until a standby is back, so the outage ends at the **rejoin**
+   (3 s after the failover in this schedule, plus the `pg_basebackup`), not
+   at the promotion (about 0.3 s). For an operator: a sync pair that loses
+   a node stops taking writes until it has two again.
+
+CI runs a matrix of workload (`api`, `pg`) by mode (`fenced`, `unfenced`,
+`negative-control`), six jobs, plus `lein test` (checker unit tests).
+
+**Local-run cut.** In the session that built this, Docker worked (with a
+local base image: the sandbox's proxy takes only HTTPS, so the node image's
+apt sources had to be rewritten, which is not committed) and Leiningen came
+from apt (2.10.0). The `pg` workload ran locally in all three modes, 60 s
+each. The `api` workload did **not** run locally: building Zigcube was not
+allowed in that sandbox, so the api runs (and ZC-E0215 under an unfenced
+failover) were checked only in CI.
+
+Open:
+- The api negative control depends on Zigcube's state dir catching the
+  loss (ZC-E0215) or the clients seeing it; if the server halts before any
+  read shows the loss, `:caught-by` is `[:zc-e0215]` alone, which is still
+  a pass but says less.
+- `:writes-ok-after` can count a write acknowledged in the few ms before
+  the nemesis's iptables rule landed (seen: 11 ms in one unfenced
+  failover). Read it together with `:gap`.
 
 ## Slice 2: leases and fencing (I1b, measuring overlap)
 
@@ -122,7 +161,7 @@ Postgres-only test is a second job. Left:
 
 ## Cross-cutting
 
-- Unfenced Postgres failover (old primary alive behind a partition), and
-  failover racing a partition, as extra nemesis schedules.
+- Failover racing a partition as an extra nemesis schedule (unfenced
+  failover is done, slice 1b).
 - Longer and randomised schedules as a nightly job; the push job stays short.
 - A table in the README mapping each invariant to the test that checks it.
