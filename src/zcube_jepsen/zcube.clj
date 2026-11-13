@@ -59,6 +59,19 @@
       {:retry-interval 500 :log-interval 5000 :timeout 90000
        :log-message "waiting for zcube-server"})))
 
+(defn diagnose-server!
+  "Logs what the server node looks like, for a server that never answered.
+  Run on the server node."
+  []
+  (doseq [cmd ["ps -eo pid,stat,etime,args | grep -E '[z]cube|[p]sql' || true"
+               "(ss -ltnp 2>/dev/null || true) | head -20"
+               "cat /etc/hosts"
+               "getent hosts pg || true"
+               "tail -n 20 /var/lib/zj/server.log || true"]]
+    (warn "server diagnostics:" cmd "\n"
+          (try (c/su (c/exec :bash :-c cmd))
+               (catch Exception e (.getMessage e))))))
+
 (defn start-agent! [test node]
   (c/su
     (cu/start-daemon!
@@ -108,7 +121,10 @@
               (pg/await-primary! "pg")
               (pg/await-sync-standby! "pg")
               (start-server! test)
-              (await-server! test))
+              (try (await-server! test)
+                   (catch Exception e
+                     (diagnose-server!)
+                     (throw e))))
 
           :else
           (do (kill-all!)
