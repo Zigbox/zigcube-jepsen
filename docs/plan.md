@@ -32,9 +32,8 @@ Postgres-only test is a second job. Left:
 4. **Negative control.** A run expected to fail (asynchronous standby, which
    Zigcube documents as unsupported, plus failover), to show the checker
    catches a real loss here.
-5. **How the server takes a failover.** The nemesis rewrites the `pg` name on
-   `n3` and does not restart the server. Record from the logs whether the
-   server reconnects by itself and how long writes fail.
+5. **Measure the outage.** The server reconnects to the new primary without
+   a restart (seen in CI). Report how long writes fail per failover.
 
 ## Slice 2: leases and fencing (I1b, measuring overlap)
 
