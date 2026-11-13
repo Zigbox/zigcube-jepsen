@@ -158,9 +158,14 @@
             eh     (elle-history history (:orders vo) store)
             dir    (.getCanonicalPath
                      (store/path! test (:subdirectory opts) "elle"))
-            res    (la/check {:consistency-models [:strict-serializable]
-                              :directory dir}
-                             eh)
+            models {:consistency-models [:strict-serializable]}
+            ; Elle draws each cycle it finds with graphviz's `dot`; without
+            ; it the check throws, so it runs again without the drawings.
+            res    (try (la/check (assoc models :directory dir) eh)
+                        (catch Exception e
+                          (warn e "Elle with plots failed; checking without")
+                          (assoc (la/check models eh)
+                                 :plots-failed (.getMessage e))))
             conflicts? (or (seq (:version-conflicts vo))
                            (seq (:value-conflicts vo)))]
         (merge res

@@ -102,6 +102,9 @@ jobs:
           chmod +x bin/lein
           bin/lein version
 
+      - name: Install graphviz (Elle draws the cycles it finds)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq graphviz
+
       - name: Fetch dependencies
         run: bin/lein deps
 
