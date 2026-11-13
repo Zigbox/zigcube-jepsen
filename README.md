@@ -19,8 +19,8 @@ Two tests on the same cluster and the same fault schedule.
 |------------|------------|
 | Nodes      | 5 Docker containers `n1`..`n5` (Ubuntu 24.04), each with its own network namespace, on bridge `10.77.0.0/24`. Jepsen runs on the host and drives them over SSH. |
 | Postgres   | `n1`: Postgres 16 primary. `n2`: synchronous streaming standby (`synchronous_standby_names = '*'`, `synchronous_commit = remote_apply`, the setup Zigcube's `docs/operations.md` supports). |
-| Faults     | A loop of: random-halves partition of all 5 nodes (iptables) for 8 s, heal, **failover** (SIGKILL the primary, check no postgres process is left on it, then promote the standby; if the old primary is not confirmed stopped the op fails and nothing is promoted), then **rejoin** (re-seed the old primary with `pg_basebackup` as the new synchronous standby). After the load: heal, rejoin, 15 s settle, then **final reads** (two per key, retried until `:ok`) of every key that was used. |
-| Checkers   | Knossos linearizability (`:linear`) per key, final reads included; a timeline per key; a sanity check that fails the run if any op kind never succeeded, fewer than `--min-failovers` failovers completed, a failover failed, any op saw `ZC-E0215` (Zigcube's halt on a detected lost write, answered `502`), or a key that got final reads got no `:ok` one. |
+| Faults     | A loop of: random-halves partition of all 5 nodes (iptables) for 8 s, **with the control host (the clients) on one side at random**: the nodes of the other half drop its traffic to ports 5432 and 7070; heal, **failover** (SIGKILL the primary, check no postgres process is left on it, then promote the standby; if the old primary is not confirmed stopped the op fails and nothing is promoted), then **rejoin** (re-seed the old primary with `pg_basebackup` as the new synchronous standby). `--failover unfenced` and `lagged` change the failover (below). After the load: heal, rejoin, 15 s settle, **final reads** (two per key, retried until `:ok`) of every key that was used, then a **store read** of every register straight from the current primary. |
+| Checkers   | Knossos linearizability (`:linear`) per key, final reads included; a timeline per key; **Elle** (`:elle`) on the history as a versioned register (every `:ok` op carries the store's version of its value; the store read closes it), strict serializable, plus version/value conflicts; **outage** (`:outage`): per failover, ms until a write issued after it was acknowledged; **sanity**: the run is vacuous if an op kind never succeeded, fewer than `--min-failovers` failovers completed, or a failover failed. The verdict (`:valid?`) is below. |
 
 **`--workload api`** (`zcube-register-api`, the default): through Zigcube.
 
@@ -40,8 +40,8 @@ Two tests on the same cluster and the same fault schedule.
 - Write values are a per-key counter (0, 1, 2, ...), never repeated within a
   key, so a read names the exact write it saw and a rollback past an
   acknowledged write cannot be explained by an `:info` write of the same
-  value. (The `pg` workload keeps its small value domain because its CAS ops
-  need values that can match.)
+  value. The `pg` workload does the same since slice 1b: a cas expects the
+  value of the latest write and sets a fresh one.
 - Zigcube has no multi-host connection string; the operator repoints the
   store's address after a failover. Here that address is the name `pg` in
   `n3`'s `/etc/hosts`, which the failover nemesis rewrites after promoting.
@@ -54,7 +54,32 @@ store fault from a server fault.
 
 Both use 10 workers, 2 per key, 60 ops per key.
 
+**Failover modes and the verdict.**
+
+| Mode | Options | Valid when |
+|---|---|---|
+| fenced | `--failover fenced` (default) | Knossos and Elle pass, not vacuous, store read worked, every finally-read key got an `:ok` read, no op saw `ZC-E0215` (Zigcube's halt when the store went back past a revision it had seen, answered `502`). |
+| unfenced | `--failover unfenced` | The same, except a `ZC-E0215` halt is an allowed ending (then the final reads are waived; Elle must still pass, which for api includes every acknowledged write above the store log's compaction point being on the surviving store's history of its key). With sync replication neither side can commit while the pair is apart, so this mode shows stalls, not split brain, and says nothing about whether fencing is needed (it is: see `unfenced-async`). The pair is cut apart from each other only, the standby promoted with the old primary alive; api repoints `zcube-server` after `--repoint-delay-ms` (5000), pg clients have no repoint (the JDBC URL lists both hosts). |
+| unfenced-async | `--replication async --failover unfenced --expect lost-write` | As the negative control: the old primary keeps acknowledging writes that the rejoin wipes, and the checkers must catch it. |
+| negative control | `--replication async --failover lagged --expect lost-write` | Not vacuous, the store read worked, Knossos or Elle caught it (`:caught-by`), and Elle's store-based facts show the loss itself (`:lost-evidence`). A `ZC-E0215` halt is reported as `:halted?` but does not count. The standby is asynchronous and cut off for `--lag-ms` (4000) before a fenced promotion, so acknowledged writes are lost. |
+
 ### Last result
+
+Slice 1b (branch `claude/jepsen-1b`), local runs of the `pg` workload, 60 s
+each: fenced valid (write outage 4.3 to 4.7 s per failover), unfenced valid
+(up to 9.3 s), negative control valid, i.e. the loss was caught by Knossos
+and Elle. With a synchronous pair the outage lasts until the old primary has
+rejoined as standby, not until promotion. The `api` workload was not run
+locally (see `docs/plan.md`, slice 1b).
+
+CI (run 43432518018, 120 s each), all six jobs green: api fenced valid
+(outage 4.7 to 5.3 s), api unfenced valid with no `ZC-E0215` halt (9.5 to
+9.9 s), api negative control caught by Elle and by a `ZC-E0215` halt; pg
+fenced valid (up to 4.5 s), pg unfenced valid (9.4 to 9.8 s), pg negative
+control caught by Knossos and Elle. (Before the PR #2 review fixes; see
+`docs/plan.md`.)
+
+Before slice 1b:
 
 CI run [43354416522](https://github.com/Zigbox/zigcube-jepsen/actions/runs/43354416522)
 on commit `1d1e4f7`, 120 s of load per job, both jobs green:
@@ -95,11 +120,17 @@ Results land in `store/<test name>/<time>/`: `results.edn`, `history.edn`,
 Options: `--workload api|pg`, `--zcube-bin DIR` (default
 `zigcube/zig-out/bin`), `--zcube-images FILE` (default
 `zigcube/fixtures/images.zon`), `--lease-ttl-ms N`, `--time-limit S`,
-`--concurrency N` (a multiple of 2), `--ops-per-key N`, `--min-failovers N`.
+`--concurrency N` (a multiple of 2), `--ops-per-key N`, `--min-failovers N`,
+`--failover fenced|unfenced|lagged`, `--replication sync|async`,
+`--expect valid|lost-write`, `--repoint-delay-ms N`, `--lag-ms N`,
+`--[no-]client-partition`. `lein test` runs the checkers' unit tests. Elle
+draws the cycles it finds with graphviz (`dot`); without it, it checks
+without drawings.
 
-CI: `.github/workflows/jepsen.yml` runs both workloads as two jobs on
-`ubuntu-24.04` for every push to `main` and `claude/harness`, and uploads
-`store/` as artifacts `jepsen-store-api` and `jepsen-store-pg`.
+CI: `.github/workflows/jepsen.yml` runs each workload in each mode (six jobs)
+on `ubuntu-24.04` for every pull request and every push to `main`,
+`claude/harness` and `claude/jepsen-1b`, and uploads `store/` as artifacts
+`jepsen-store-<workload>-<mode>`.
 
 ## Fault primitives in containers
 
@@ -130,23 +161,7 @@ clock-offset test hook in the binaries, or KVM guests with their own clocks.
   update between two writers, only stale or impossible reads.
 - **Only the apply and list paths of the server are exercised.** Agents run
   and are told to start containers, but nothing checks what they did.
-- **No unfenced failover.** The nemesis kills the old primary and checks it
-  stopped before promoting. An unfenced failover (old primary alive behind a
-  partition, still serving reads) is the interesting case for the fencing
-  inequality and is not run.
-- **Partitions do not cut clients off.** Clients run on the control host,
-  which is never partitioned from the nodes. A partition separates the
-  server from Postgres, the agents from the server, or primary from standby,
-  depending on how the random halves fall.
 - **No clock faults and no SIGSTOP in the test**, only the probe.
-- **No negative control.** There is no run that is expected to fail, so the
-  checker has not been shown to catch a real violation in this setup. It
-  would be a third job with `synchronous_commit = off` and no
-  `synchronous_standby_names` (an async standby), so a failover loses
-  acknowledged writes, run with the same fault schedule and a job that
-  passes only if the run comes out invalid: `:linear` `false` or the sanity
-  check failing on `ZC-E0215`. Until it exists, "linearizable" means only
-  that no violation was observable.
 - **The api workload has run only in CI.** The session that wrote it could
   not build Zigcube locally (its Zigbox dependency could not be fetched
   there).
@@ -163,8 +178,11 @@ src/zcube_jepsen/postgres.clj   primary + sync standby setup, failover nemesis
 src/zcube_jepsen/zcube.clj      zcube-server and zcube-agent on the nodes
 src/zcube_jepsen/api.clj        register client over zcube-server's HTTP API
 src/zcube_jepsen/register.clj   CAS register client over JDBC (pg workload)
+src/zcube_jepsen/nemesis.clj    partitions that include the control host
+src/zcube_jepsen/checkers.clj   Elle versioned register, outage, sanity, verdict
+test/                           checker unit tests
 docker/                         node image, up/down, fault probe
-docs/plan.md                    later slices
+docs/plan.md                    slices: what is done and what is next
 ```
 
 ## License

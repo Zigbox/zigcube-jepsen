@@ -108,6 +108,7 @@
   []
   (reify db/DB
     (setup! [_ test node]
+      (pg/flush-rules!)
       (let [[primary _] (pg/pg-nodes test)]
         (cond
           (some #{node} (pg/pg-nodes test))
@@ -119,7 +120,7 @@
               (install! test :server)
               (point-pg! primary)
               (pg/await-primary! "pg")
-              (pg/await-sync-standby! "pg")
+              (pg/await-standby! test "pg")
               (start-server! test)
               (try (await-server! test)
                    (catch Exception e
