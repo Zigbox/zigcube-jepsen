@@ -130,6 +130,8 @@
 (defn setup-node!
   "Sets up Postgres on this node if it is one of the pair."
   [test node]
+  ; See flush-rules! (defined further down, after the pair rules).
+  (c/su (c/exec :iptables :-w :-F))
   (let [[primary standby] (pg-nodes test)]
     (condp = node
       primary (do (wipe!)
@@ -157,15 +159,22 @@
     (log-files [_ test node]
       (if (some #{node} (pg-nodes test)) [log-file] []))))
 
+(def pair-tag
+  "The comment on isolate-pair!'s rules, so heal-pair! removes only those and
+  never an identical-looking rule of a partition grudge. (The partition
+  nemesis's heal, `iptables -F`, still flushes these too: the schedule never
+  runs a failover during a partition.)"
+  "zj-pair")
+
 (defn isolate-pair!
   "Drops all traffic between nodes a and b, both ways, with rules of its own
-  (heal-pair! removes exactly these, leaving any other partition alone)."
+  (tagged pair-tag; heal-pair! removes exactly these)."
   [test a b]
   (let [ips {a (cn/ip b) b (cn/ip a)}]
     (c/on-nodes test [a b]
                 (fn [_ node]
-                  (c/su (c/exec :iptables :-A :INPUT :-s (ips node) :-j :DROP
-                                :-w))))))
+                  (c/su (c/exec :iptables :-w :-A :INPUT :-s (ips node)
+                                :-m :comment :--comment pair-tag :-j :DROP))))))
 
 (defn heal-pair!
   "Removes isolate-pair!'s rules (all copies; none is fine)."
@@ -175,7 +184,17 @@
                 (fn [_ node]
                   (c/su (c/exec :bash :-c
                                 (str "while iptables -w -D INPUT -s " (ips node)
+                                     " -m comment --comment " pair-tag
                                      " -j DROP 2>/dev/null; do :; done")))))))
+
+(defn flush-rules!
+  "Removes every iptables filter rule on this node. Run first in each node's
+  db setup: the nemesis heals in its own setup!, but Jepsen sets up the db
+  before the nemesis, so rules left by a run that was killed mid-partition
+  would otherwise block pg_basebackup or the server check (CI recreates the
+  containers, a local re-run need not)."
+  []
+  (c/su (c/exec :iptables :-w :-F)))
 
 (defn promote! [test node]
   (c/on-nodes test [node]

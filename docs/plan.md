@@ -38,23 +38,47 @@ agents on `n4`, `n5`; the register goes through `POST /v1/apply` and
    ops are counted as `:unverifiable`. Knossos stays on as a cross-check. The API still has no compare-and-set, so the api model
    stays a plain register; pg cas ops now use unique values too.
 3. **Unfenced failover.** Done: `--failover unfenced`. The pair is cut
-   apart, the standby promoted with the old primary alive, and clients (and
-   `zcube-server`) repointed only after `--repoint-delay-ms` (5 s). The
-   verdict allows a ZC-E0215 halt only in this mode, and even then Elle and
-   Knossos must pass. For pg that means the store read holds every
-   acknowledged write; for api it means so for every acknowledged write
-   above the log's compaction point (item 2).
-   As configured, this mode cannot lose an acknowledged write for a
-   structural reason: the promoted standby inherits
-   `synchronous_standby_names = '*'` and has no standby until the rejoin, and
-   the old primary has lost its, so neither side can commit. It shows that
-   writes stall; it does not exercise split brain (see Open).
-   Local pg run: valid, no halt (pg has no server to halt).
+   apart from each other only (the server and the clients still reach both
+   nodes), and the standby is promoted with the old primary alive.
+   - api: `zcube-server` stays on the old primary for `--repoint-delay-ms`
+     (5 s), then is repointed.
+   - pg: there is no repoint. The JDBC URL lists both hosts with
+     `targetServerType=primary`, so from the promotion on a reconnecting
+     client may reach either primary; open connections stay where they are.
+   The verdict allows a ZC-E0215 halt only in this mode, and even then Elle
+   and Knossos must pass (for api, Elle includes the store-log check of
+   item 2).
+
+   **What this mode does and does not show.** With `--replication sync`
+   (`remote_apply`, `synchronous_standby_names = '*'`) it cannot produce an
+   acknowledged write on the old timeline at all, whatever the repoint
+   delay: the old primary has lost its synchronous standby, so every commit
+   on it blocks until the client's timeout or the rejoin, and the client
+   records `:info`; the promoted node inherits the same setting and has no
+   standby until the rejoin, so it cannot commit either. "Unfenced, no lost
+   write" here is a property of synchronous replication, **not** evidence
+   that fencing is unnecessary: an asynchronous or quorum setup without
+   fencing can lose acknowledged writes, which the `unfenced-async` CI job
+   shows (below). What the sync unfenced mode does exercise is the known
+   Postgres hazard of a commit that is locally visible on the old primary
+   but not yet replicated: a read there can see a write that the rejoin
+   then wipes. Elle would flag such a read; none was seen.
+
+   **unfenced-async** (CI job, review of PR #2): `--replication async
+   --failover unfenced --expect lost-write`. The old primary keeps
+   acknowledging writes while it is still reachable; the rejoin wipes them.
+   It passes only if the checkers catch that loss, like the negative
+   control.
+   Local pg run (sync): valid, no halt (pg has no server to halt).
 4. **Negative control.** Done: `--replication async --failover lagged
    --expect lost-write`. The standby is asynchronous and cut off for
    `--lag-ms` (4 s) before a fenced promotion, so writes acknowledged in
-   that window are lost. The run is valid only if it is not vacuous and
-   Knossos or Elle caught the loss. A ZC-E0215 halt is reported
+   that window are lost. The run is valid only if `sanity` is exactly
+   `true` (not vacuous), the final store read worked, Knossos or Elle
+   caught it, and Elle's store-based facts show the loss itself
+   (`:lost-evidence`: a re-used version, an acknowledged op off the
+   surviving chain, or an acknowledged write beyond the store's version of
+   its key); any other anomaly alone does not count. A ZC-E0215 halt is reported
    (`:halted?`) but does not count: the control shows that the checkers
    catch the loss, not that Zigcube does. Local pg run: caught
    by both Knossos and Elle (G-single-item, G0-realtime, G1c,
@@ -72,7 +96,16 @@ agents on `n4`, `n5`; the register goes through `POST /v1/apply` and
    a node stops taking writes until it has two again.
 
 CI runs a matrix of workload (`api`, `pg`) by mode (`fenced`, `unfenced`,
-`negative-control`), six jobs, plus `lein test` (checker unit tests).
+`negative-control`, `unfenced-async`), eight jobs, plus `lein test` (checker
+unit tests, including a table test of the verdict and the vacuity reasons).
+
+The negative controls (`negative-control`, `unfenced-async`) pass only with
+direct evidence of the loss from Elle's store-based facts (`:lost-evidence`:
+a version re-used for two values, an acknowledged op off the surviving
+chain, or an acknowledged write beyond the store's version of its key), not
+on any anomaly, and not on a ZC-E0215 halt. A failed rejoin now makes a run
+vacuous (`:a-rejoin-failed`), and every node's db setup first flushes
+iptables, so a re-run after a killed run does not inherit its rules.
 
 **Local-run cut.** In the session that built this, Docker worked (with a
 local base image: the sandbox's proxy takes only HTTPS, so the node image's
@@ -96,9 +129,10 @@ table is replaced once CI has run on them.
 | pg | unfenced | valid | 9384 to 9793 (4) |
 | pg | negative control | caught by Knossos and Elle | - |
 
-So unfenced failover, as scheduled here, ended in stalls (about 9.5 s,
-the repoint delay plus the rejoin) and never in lost writes or a halt; the
-ZC-E0215 path was exercised only by the negative control.
+So unfenced failover with sync replication ended in stalls (about 9.5 s,
+up to the rejoin) and never in a halt; as item 3 explains, sync replication
+rules out a lost acknowledged write there by construction. The ZC-E0215
+path was exercised only by the negative control.
 
 Open:
 - `:writes-ok-after` used to count a write acknowledged on the old primary
@@ -111,15 +145,15 @@ Open:
   issued after it was acknowledged before the next failover or the end).
   Not a safety problem (Elle and Knossos pass), but worth a look in the
   artifact `jepsen-store-pg-fenced` if it recurs.
-- Unfenced does not exercise split brain (item 3): neither side can
-  commit. Two follow-ups (review of PR #2): a variant in which the promoted
-  node drops `synchronous_standby_names` (the operator's emergency step), so
-  that it commits while the old primary is alive; and recording which node
-  served each op, with a `sanity` fact that the unfenced window actually
-  served ops from the old primary. Note that a Postgres commit waiting on
-  its sync standby is already visible to other sessions on that node, so
-  the variant may show reads of writes that are later lost; that would be
-  a finding about the setup, not a checker bug.
+- Sync unfenced does not exercise split brain (item 3). `unfenced-async`
+  now does, with an expected loss. Still open (review of PR #2): recording
+  which node served each op, with a `sanity` fact that the unfenced window
+  actually served ops from the old primary; and a variant in which the
+  promoted node drops `synchronous_standby_names` (the operator's emergency
+  step), which would need its own expectation, since a Postgres commit
+  waiting on its sync standby is already visible to other sessions there.
+- The partition nemesis's heal (`iptables -F`) also removes the pair rules
+  of a failover; safe only because the schedule never overlaps the two.
 
 ## Slice 2: leases and fencing (I1b, measuring overlap)
 

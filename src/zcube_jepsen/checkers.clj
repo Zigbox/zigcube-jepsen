@@ -99,6 +99,23 @@
       {:off-chain    (vec (distinct (remove on? high)))
        :unverifiable (count (distinct (remove on? low)))})))
 
+(defn beyond-store
+  "Acknowledged writes (and cas) the store read cannot hold: at a version
+  above the store's version of the key, or of a key the store has no row
+  for. Such a write was acknowledged and is not in the surviving store
+  (versions only grow), whatever happened to other keys. Nil without a
+  store read."
+  [history store]
+  (when store
+    (vec (for [op history
+               :when (and (client-op? op) (= :ok (:type op))
+                          (#{:write :cas} (:f op)) (:version op))
+                     :let [[k v] (kv op)
+                           ver (:version op)
+                           [_ sver] (get (:live store) k [nil 0])]
+                     :when (< sver ver)]
+           [k ver (if (= :cas (:f op)) (second v) v)]))))
+
 (defn surviving-obs
   "The observations that make the version order: with :chains, the chain
   entries and whatever is at or below the compaction point (off-chain ones
@@ -213,9 +230,11 @@
                           (warn e "Elle with plots failed; checking without")
                           (assoc (la/check models eh)
                                  :plots-failed (.getMessage e))))
+            beyond (beyond-store history store)
             conflicts? (or (seq (:version-conflicts vo))
                            (seq (:value-conflicts vo))
-                           (seq (:off-chain chain)))]
+                           (seq (:off-chain chain))
+                           (seq beyond))]
         (merge res
                {:valid? (if conflicts? false (:valid? res))
                 :store-read? (some? store)
@@ -224,6 +243,14 @@
                 :off-chain (take 10 (:off-chain chain))
                 :off-chain-count (count (:off-chain chain))
                 :unverifiable (:unverifiable chain)
+                :beyond-store (take 10 beyond)
+                :beyond-store-count (count beyond)
+                ; Direct evidence that an acknowledged write is not in the
+                ; surviving store (what the negative control must show).
+                :lost-evidence (cond-> []
+                                 (seq (:version-conflicts vo)) (conj :version-conflicts)
+                                 (seq (:off-chain chain))      (conj :off-chain)
+                                 (seq beyond)                  (conj :beyond-store))
                 :keys (count (:orders vo))
                 :version-conflicts (take 10 (:version-conflicts vo))
                 :value-conflicts   (take 10 (:value-conflicts vo))})))))
@@ -386,6 +413,10 @@
                       (conj :an-op-kind-never-succeeded)
                       (< fos min-failovers) (conj :too-few-failovers)
                       (seq bad-fos)         (conj :a-failover-failed)
+                      ; After a failed rejoin every later failover is skipped
+                      ; and a sync primary takes no writes: the rest of the
+                      ; schedule would do nothing.
+                      (seq bad-rejoins)     (conj :a-rejoin-failed)
                       (empty? final-keys)   (conj :no-final-reads))]
         {:valid?    (empty? vacuous)
          :vacuous   vacuous
@@ -424,10 +455,18 @@
     store's history of its key).
 
   :expect :lost-write (the negative control)
-    The run is not vacuous, and Knossos or Elle found a violation. A ZC-E0215
-    halt is reported (:halted?) but does not count: it is Zigcube catching
-    the loss, and the control is there to show that the checkers do. Valid
-    means the checkers have teeth here."
+    The run is not vacuous, the store read worked, Knossos or Elle found a
+    violation, and Elle's store-based facts show the loss itself
+    (:lost-evidence: a version re-used for two values, an acknowledged op off
+    the surviving chain, or an acknowledged write beyond the store's version
+    of its key). Any other anomaly alone does not count: it would hide a
+    control that stopped losing writes. A ZC-E0215 halt is reported
+    (:halted?) but does not count either: it is Zigcube catching the loss,
+    and the control is there to show that the checkers do. Valid means the
+    checkers have teeth here.
+
+  Sanity's :valid? must be exactly true: a sanity checker that threw comes
+  back as :unknown, which is no vacuity guard."
   [checkers]
   (let [inner (checker/compose checkers)]
     (reify checker/Checker
@@ -437,7 +476,7 @@
               linear  (:valid? (:linear r))
               elle    (:valid? (:elle r))
               halted? (:halted? sanity)
-              fine?   (:valid? sanity)
+              fine?   (true? (:valid? sanity))
               sread?  (map? (:store-read sanity))
               halt-ok? (= :unfenced (:failover test))
               finals? (empty? (:final-read-keys-without-ok sanity))
@@ -447,6 +486,7 @@
           (assoc r
                  :expected (:expect test :valid)
                  :caught-by caught
+                 :lost-evidence (vec (:lost-evidence (:elle r)))
                  :halted? (boolean halted?)
                  :valid?
                  (case (:expect test :valid)
@@ -459,4 +499,5 @@
                          :else (checker/merge-valid [linear elle]))
 
                    :lost-write
-                   (boolean (and fine? (seq caught))))))))))
+                   (boolean (and fine? sread? (seq caught)
+                                 (seq (:lost-evidence (:elle r))))))))))))

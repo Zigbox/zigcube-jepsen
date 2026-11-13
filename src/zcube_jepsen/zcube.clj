@@ -108,6 +108,7 @@
   []
   (reify db/DB
     (setup! [_ test node]
+      (pg/flush-rules!)
       (let [[primary _] (pg/pg-nodes test)]
         (cond
           (some #{node} (pg/pg-nodes test))

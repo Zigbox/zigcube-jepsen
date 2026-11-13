@@ -29,10 +29,16 @@ jobs:
         workload: [api, pg]
         # fenced: the supported failover; must find nothing.
         # unfenced: promote with the old primary still up; must find no lost
-        #   write (a ZC-E0215 halt is an allowed ending).
+        #   write (a ZC-E0215 halt is an allowed ending). With sync
+        #   replication neither side can commit while the pair is apart, so
+        #   this shows stalls, not split brain.
         # negative-control: an asynchronous standby, cut off before a fenced
         #   promotion; passes only if the checkers catch the lost writes.
-        mode: [fenced, unfenced, negative-control]
+        # unfenced-async: unfenced promotion with an asynchronous standby, so
+        #   the old primary keeps acknowledging writes that the rejoin then
+        #   wipes: the split brain fencing exists to prevent. Passes only if
+        #   the checkers catch the loss.
+        mode: [fenced, unfenced, negative-control, unfenced-async]
         include:
           - mode: fenced
             mode_args: --failover fenced
@@ -40,6 +46,8 @@ jobs:
             mode_args: --failover unfenced
           - mode: negative-control
             mode_args: --replication async --failover lagged --expect lost-write
+          - mode: unfenced-async
+            mode_args: --replication async --failover unfenced --expect lost-write
     env:
       LEIN_VERSION: "2.11.2"
       # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.

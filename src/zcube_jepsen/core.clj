@@ -183,8 +183,11 @@
     :default 1 :parse-fn parse-long]
    [nil "--failover MODE"
     (str "fenced: stop the old primary, then promote. unfenced: cut the pair"
-         " apart and promote with the old primary still up, clients still"
-         " pointed at it for --repoint-delay-ms. lagged: cut the pair apart"
+         " apart and promote with the old primary still up; api: zcube-server"
+         " stays on it for --repoint-delay-ms; pg: the JDBC URL lists both"
+         " hosts, so clients may reach either primary at once. With"
+         " --replication sync neither side can commit until the rejoin."
+         " lagged: cut the pair apart"
          " for --lag-ms, then fence and promote (only loses writes with"
          " --replication async).")
     :default :fenced :parse-fn keyword
@@ -198,7 +201,7 @@
          " the run passes only if the checkers catch a loss.")
     :default :valid :parse-fn keyword
     :validate [#{:valid :lost-write} "must be valid or lost-write"]]
-   [nil "--repoint-delay-ms N" "unfenced: how long clients stay on the old primary."
+   [nil "--repoint-delay-ms N" "unfenced, api only: how long zcube-server stays on the old primary (pg clients have no repoint)."
     :default 5000 :parse-fn parse-long]
    [nil "--lag-ms N" "lagged: how long the standby is cut off before promotion."
     :default 4000 :parse-fn parse-long]

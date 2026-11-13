@@ -97,11 +97,13 @@
 
 (def api-parse identity)
 
-(defn vr [history]
+(defn vr-with [parse history]
   ; Elle writes its explanations under the test's store directory.
   (let [dir (doto (java.io.File/createTempFile "elle" "") (.delete) (.mkdirs))]
     (with-redefs [store/path! (fn [& _] dir)]
-      (checker/check (c/versioned-register api-parse) {} history {}))))
+      (checker/check (c/versioned-register parse) {} history {}))))
+
+(defn vr [history] (vr-with api-parse history))
 
 (def splice
   ; The reviewer's history: 1 is acked at revision 100 on the old primary,
@@ -155,29 +157,145 @@
               ["log /services/r1x" "103" (j 3)]])))))
 
 ;; ---------------------------------------------------------------------------
-;; Verdict: the negative control needs the checkers, not the halt
+;; Verdict
 
-(defn verdict-of [results expect]
+(defn verdict-of
+  "The verdict over stub results for :linear, :elle and :sanity."
+  [results test]
   (let [fixed (fn [r] (reify checker/Checker (check [_ _ _ _] r)))
         v (c/verdict {:linear (fixed (:linear results))
                       :elle   (fixed (:elle results))
                       :sanity (fixed (:sanity results))})]
-    (checker/check v {:expect expect :failover :lagged} (hist) {})))
+    (checker/check v test (hist) {})))
 
-(deftest negative-control-needs-a-checker
-  (let [sanity {:valid? true :halted? true :store-read {:node "n1" :rows 1}
-                :final-read-keys-without-ok []}]
-    (testing "halted, but Knossos and Elle passed: the control fails"
-      (let [r (verdict-of {:linear {:valid? true} :elle {:valid? true}
-                           :sanity sanity} :lost-write)]
-        (is (false? (:valid? r)))
-        (is (true? (:halted? r)))
-        (is (= [] (:caught-by r)))))
-    (testing "Elle caught it: the control passes"
-      (let [r (verdict-of {:linear {:valid? true} :elle {:valid? false}
-                           :sanity sanity} :lost-write)]
-        (is (true? (:valid? r)))
-        (is (= [:elle] (:caught-by r)))))))
+(def ok-sanity {:valid? true :halted? false :store-read {:node "n1" :rows 1}
+                :final-read-keys-without-ok []})
+(def halted (assoc ok-sanity :halted? true))
+(def pass {:valid? true})
+(def elle-lost {:valid? false :lost-evidence [:off-chain]})
+
+(deftest verdict-table
+  (doseq [[why want results test]
+          [["fenced, clean" true
+            {:linear pass :elle pass :sanity ok-sanity} {:failover :fenced}]
+           ["fenced + halt" false
+            {:linear pass :elle pass :sanity halted} {:failover :fenced}]
+           ["lagged, expect valid, + halt" false
+            {:linear pass :elle pass :sanity halted} {:failover :lagged}]
+           ["unfenced + halt + Elle false" false
+            {:linear pass :elle {:valid? false} :sanity halted} {:failover :unfenced}]
+           ["unfenced + halt + Elle true" true
+            {:linear pass :elle pass :sanity halted} {:failover :unfenced}]
+           ["unfenced + halt + final reads missing" true
+            {:linear pass :elle pass
+             :sanity (assoc halted :final-read-keys-without-ok [3])}
+            {:failover :unfenced}]
+           ["fenced + final reads missing, no halt" false
+            {:linear pass :elle pass
+             :sanity (assoc ok-sanity :final-read-keys-without-ok [3])}
+            {:failover :fenced}]
+           ["valid + store read missing" false
+            {:linear pass :elle pass :sanity (assoc ok-sanity :store-read :none)}
+            {:failover :fenced}]
+           ["valid + sanity unknown" false
+            {:linear pass :elle pass :sanity (assoc ok-sanity :valid? :unknown)}
+            {:failover :fenced}]
+           ["lost-write, Elle caught it with evidence" true
+            {:linear pass :elle elle-lost :sanity ok-sanity}
+            {:failover :lagged :expect :lost-write}]
+           ["lost-write + halt, checkers passed" false
+            {:linear pass :elle pass :sanity halted}
+            {:failover :lagged :expect :lost-write}]
+           ["lost-write + vacuous" false
+            {:linear pass :elle elle-lost
+             :sanity (assoc ok-sanity :valid? false :vacuous [:too-few-failovers])}
+            {:failover :lagged :expect :lost-write}]
+           ["lost-write + sanity unknown" false
+            {:linear pass :elle elle-lost :sanity (assoc ok-sanity :valid? :unknown)}
+            {:failover :lagged :expect :lost-write}]
+           ["lost-write + store read missing" false
+            {:linear pass :elle elle-lost :sanity (assoc ok-sanity :store-read :none)}
+            {:failover :lagged :expect :lost-write}]
+           ["lost-write, an anomaly but no evidence of a loss" false
+            {:linear {:valid? false} :elle {:valid? false :lost-evidence []}
+             :sanity ok-sanity}
+            {:failover :lagged :expect :lost-write}]]]
+    (testing why
+      (let [r (verdict-of results test)]
+        (is (= want (:valid? r)) (pr-str (select-keys r [:valid? :caught-by
+                                                         :lost-evidence])))))))
+
+(deftest negative-control-reports-the-halt-apart
+  (let [r (verdict-of {:linear pass :elle elle-lost :sanity halted}
+                      {:failover :lagged :expect :lost-write})]
+    (is (true? (:valid? r)))
+    (is (true? (:halted? r)))
+    (is (= [:elle] (:caught-by r)))
+    (is (= [:off-chain] (:lost-evidence r)))))
+
+;; ---------------------------------------------------------------------------
+;; Sanity
+
+(defn sanity-of [& ops]
+  (checker/check (c/sanity #{:write :read} 1) {} (apply hist ops) {}))
+
+(def sane-run
+  [[0 :invoke :write [1 0]] [0 :ok :write [1 0] 1]
+   [:nemesis :info :failover nil] [:nemesis :info :failover [:promoted "n2"]]
+   [:nemesis :info :rejoin nil] [:nemesis :info :rejoin [:rejoined "n1"]]
+   [:nemesis :info :final-phase nil]
+   [0 :invoke :read [1 nil]] [0 :ok :read [1 0] 1]
+   [:nemesis :info :store-read nil]
+   [:nemesis :info :store-read {:node "n2" :rows [[1 0 1]]}]])
+
+(deftest sanity-vacuity
+  (testing "a run that did everything"
+    (let [r (apply sanity-of sane-run)]
+      (is (true? (:valid? r)) (pr-str r))
+      (is (= [] (:vacuous r)))))
+  (testing "no read ever succeeded"
+    (let [r (apply sanity-of (remove #(= [0 :ok :read [1 0] 1] %) sane-run))]
+      (is (some #{:an-op-kind-never-succeeded} (:vacuous r)))))
+  (testing "no failover"
+    (let [r (apply sanity-of (remove #(= [:nemesis :info :failover [:promoted "n2"]] %)
+                                     sane-run))]
+      (is (some #{:too-few-failovers} (:vacuous r)))))
+  (testing "a failover failed"
+    (let [r (apply sanity-of (concat sane-run
+                                     [[:nemesis :info :failover nil]
+                                      [:nemesis :info :failover [:failover-failed "n2" "x"]]]))]
+      (is (some #{:a-failover-failed} (:vacuous r)))))
+  (testing "a rejoin failed"
+    (let [r (apply sanity-of (concat sane-run
+                                     [[:nemesis :info :rejoin nil]
+                                      [:nemesis :info :rejoin [:rejoin-failed "n1" "x"]]]))]
+      (is (some #{:a-rejoin-failed} (:vacuous r)))))
+  (testing "no final reads"
+    (let [r (apply sanity-of (remove #(= :final-phase (nth % 2)) sane-run))]
+      (is (some #{:no-final-reads} (:vacuous r)))))
+  (testing "a halt is a fact, not vacuity"
+    (let [halt (h/op {:index 99 :time 99000000 :process 0 :type :info
+                      :f :write :value [1 1] :error [502 "ZC-E0215"]})
+          r (checker/check (c/sanity #{:write :read} 1) {}
+                           (h/history (conj (vec (apply hist sane-run)) halt)
+                                      {:dense-indices? false})
+                           {})]
+      (is (true? (:halted? r)))
+      (is (true? (:valid? r))))))
+
+;; ---------------------------------------------------------------------------
+;; pg: an acknowledged write beyond the store's version of its key
+
+(deftest beyond-store-write
+  (testing "a lost write on a key nobody wrote again: no version re-used"
+    (let [h (hist [0 :invoke :write [1 0]] [0 :ok :write [1 0] 1]
+                  [0 :invoke :write [1 1]] [0 :ok :write [1 1] 2]
+                  [0 :invoke :write [2 5]] [0 :ok :write [2 5] 1]
+                  (store-op [[1 0 1]]))
+          r (vr-with parse h)]
+      (is (false? (:valid? r)))
+      (is (= [[1 2 1] [2 1 5]] (:beyond-store r)))
+      (is (= [:beyond-store] (:lost-evidence r))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Outage: only writes issued after the promotion count
