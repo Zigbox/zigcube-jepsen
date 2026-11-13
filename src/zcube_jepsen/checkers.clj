@@ -49,16 +49,21 @@
 (defn observations
   "Every [k version value] the history shows: :ok writes and cas (the value
   written, at the version answered), :ok reads (the value read, at the key's
-  version), and the store read."
+  version; for a cas also the value it replaced, at the version before),
+  and the store read."
   [history store]
   (concat
-    (for [op history
-          :when (and (client-op? op) (= :ok (:type op)) (:version op))
-          :let [[k v] (kv op)]]
-      (case (:f op)
-        :write [k (:version op) v]
-        :cas   [k (:version op) (second v)]
-        :read  [k (:version op) v]))
+    (mapcat
+      (fn [op]
+        (let [[k v] (kv op) ver (:version op)]
+          (case (:f op)
+            :write [[k ver v]]
+            ; A cas's version is its new value's; the value it replaced was
+            ; at the version before (only the pg workload has cas, and its
+            ; versions count up by one per change).
+            :cas   [[k (dec ver) (first v)] [k ver (second v)]]
+            :read  [[k ver v]])))
+      (filter #(and (client-op? %) (= :ok (:type %)) (:version %)) history))
     (for [[k [v ver]] store] [k ver v])))
 
 (defn version-orders
@@ -110,7 +115,7 @@
                [[:r k nil]])
       :cas   (let [[old new] v]
                (if (and ok? ver)
-                 [[:r k (prefix orders k ver old)] [:append k new]]
+                 [[:r k (prefix orders k (dec ver) old)] [:append k new]]
                  [[:r k nil] [:append k new]])))))
 
 (defn elle-history

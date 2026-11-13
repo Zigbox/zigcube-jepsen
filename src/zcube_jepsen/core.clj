@@ -32,15 +32,19 @@
 
 (defn unique-ops
   "Writes and cas ops whose new values are never repeated within one key (call
-  it once per key). A cas expects the latest value handed out or the one
-  before it, so a fair share of them succeed."
+  it once per key). A cas expects the value of the latest write handed out
+  (not a cas's: most of those fail), so a fair share of them succeed. Before
+  the key's first write, it writes."
   []
-  (let [n (atom -1)]
-    [(fn [_ _] {:type :invoke :f :write :value (swap! n inc)})
-     (fn [_ _] (let [cur @n
-                     old (if (and (pos? cur) (< (rand) 0.3)) (dec cur) cur)]
-                 {:type :invoke :f :cas
-                  :value [(max old 0) (swap! n inc)]}))]))
+  (let [n      (atom -1)
+        last-w (atom nil)
+        write  (fn [] (let [v (swap! n inc)]
+                        (reset! last-w v)
+                        {:type :invoke :f :write :value v}))]
+    [(fn [_ _] (write))
+     (fn [_ _] (if-let [old @last-w]
+                 {:type :invoke :f :cas :value [old (swap! n inc)]}
+                 (write)))]))
 
 (defn nemesis-schedule
   "Partition, heal, fail over, rejoin; repeat."
