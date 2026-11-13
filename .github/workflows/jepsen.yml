@@ -121,5 +121,6 @@ jobs:
 
       - name: Node logs on failure
         if: failure()
-        run: for i in 1 2 3 4 5; do echo "== n$i"; docker logs "n$i" 2>&1 | tail -n 20; done
+        run: |
+          for i in 1 2 3 4 5; do echo "== n$i"; docker logs "n$i" 2>&1 | tail -n 20; done
           tail -n 60 store/latest/n3/server.log 2>/dev/null || true

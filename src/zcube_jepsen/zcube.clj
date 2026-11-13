@@ -75,9 +75,9 @@
   "Kills the server, the agent and everything the fake runtime started."
   []
   (c/su (c/exec :bash :-c
+                ; [z]: so that -f does not match this very shell.
                 (str "pkill -9 -x zcube-server; pkill -9 -x zcube-agent; "
-                     "pkill -9 -f 'zcube-agent supervise'; "
-                     "pkill -9 -f 'zj-replica'; true"))))
+                     "pkill -9 -f '[z]cube-agent supervise'; true"))))
 
 (defn install! [test role]
   (let [bin (:zcube-bin test)]
