@@ -56,13 +56,19 @@ Both use 10 workers, 2 per key, 60 ops per key.
 
 ### Last result
 
-CI run 4 on `claude/harness`, 120 s of load, `api` workload: 1323 writes and
-1315 reads succeeded, 5 failovers and 5 rejoins, every key linearizable.
-During faults 89 requests timed out and 62 got `503` ZC-E0201 (store
-unavailable). The server reconnected to the new primary by itself each time.
-The agents logged "registering the node again, with no containers" during
-the outages: they fenced themselves when keepalives stopped, as
-`docs/authority.md` says they should. Nothing checks that yet (slice 2).
+CI run [43354416522](https://github.com/Zigbox/zigcube-jepsen/actions/runs/43354416522)
+on commit `1d1e4f7`, 120 s of load per job, both jobs green:
+
+| workload | ok ops | failovers / rejoins | final reads | verdict |
+|---|---|---|---|---|
+| `pg` | 1555 write, 1712 read, 290 cas | 5 / 5 | 162 ok over 81 keys | every key linearizable, sanity valid |
+| `api` | 449 write, 1592 read | 4 / 4 | 104 ok over 52 keys | every key linearizable, sanity valid |
+
+Write values are unique per key, a final read of every key follows the heal,
+and no op carried ZC-E0215. Earlier numbers (run 4 and the head run before
+this change) came from the 5-value register without final reads and say
+little about lost writes. Nothing yet checks that the agents fence themselves
+during outages (slice 2).
 
 ## How to run it
 
