@@ -47,6 +47,25 @@
   (c/su (c/exec :pkill :-9 :-u :postgres (c/lit "|| true"))
         (c/exec :rm :-f (str data-dir "/postmaster.pid"))))
 
+(defn postgres-procs
+  "How many processes the postgres user has on this node."
+  []
+  (parse-long (c/su (c/exec :bash :-c "pgrep -c -u postgres || true"))))
+
+(defn fence!
+  "SIGKILLs Postgres on this node and checks that it is gone: no process of
+  the postgres user left. Retries the kill briefly (a backend may be forking),
+  then throws, so a primary that is still alive is never failed over from."
+  []
+  (loop [tries 0]
+    (kill!)
+    (let [n (postgres-procs)]
+      (cond (zero? n) :stopped
+            (< tries 10) (do (Thread/sleep 200) (recur (inc tries)))
+            :else (throw (ex-info (str "primary not stopped: " n
+                                       " postgres processes left")
+                                  {:processes n}))))))
+
 (defn wipe! []
   (kill!)
   (c/su (c/exec :rm :-rf "/var/lib/zj")
@@ -122,8 +141,11 @@
 (defn failover-nemesis
   "Handles two ops.
 
-  :failover  SIGKILLs the primary, then promotes the standby. The old
-             primary stays down (this is a fenced failover: no split brain).
+  :failover  SIGKILLs the primary and checks that no postgres process is left
+             on it (fence!); only then promotes the standby. If the old
+             primary cannot be confirmed stopped, nothing is promoted and the
+             op's value is [:failover-failed ...], which fails the run. The
+             old primary stays down until :rejoin.
   :rejoin    Re-seeds the old primary from the new one as its synchronous
              standby. Until this succeeds, commits on the new primary block.
 
@@ -142,15 +164,19 @@
           :failover
           (if-not standby-up?
             (assoc op :value [:skipped :no-standby])
-            (do (c/on-nodes test [primary] (fn [_ _] (kill!)))
-                (c/on-nodes test [standby]
-                            (fn [_ _] (pg! :pg_ctl :-D data-dir :-w :-t 60 :promote)))
-                (when on-promote (on-promote test standby))
-                (swap! state #(-> %
-                                  (assoc :primary standby :standby primary
-                                         :standby-up? false)
-                                  (update :failovers inc)))
-                (assoc op :value [:promoted standby :killed primary])))
+            (try
+              (c/on-nodes test [primary] (fn [_ _] (fence!)))
+              (c/on-nodes test [standby]
+                          (fn [_ _] (pg! :pg_ctl :-D data-dir :-w :-t 60 :promote)))
+              (when on-promote (on-promote test standby))
+              (swap! state #(-> %
+                                (assoc :primary standby :standby primary
+                                       :standby-up? false)
+                                (update :failovers inc)))
+              (assoc op :value [:promoted standby :killed primary :fenced])
+              (catch Exception e
+                (warn e "failover failed")
+                (assoc op :value [:failover-failed primary (.getMessage e)]))))
 
           :rejoin
           (if standby-up?

@@ -96,10 +96,13 @@
                 s   (:status res)]
             (cond
               (= 200 s) (assoc op :type :ok)
-              ; Refused before or instead of writing: 400 invalid, 409 the
-              ; compare kept failing (ZC-E0105).
-              (#{400 404 409} s) (assoc op :type :fail :error [s (code res)])
-              ; 5xx: the store may or may not have committed.
+              ; Refused before or instead of writing: 400 invalid, or 409
+              ; ZC-E0105 (the compare kept failing, so nothing was written).
+              ; Any other 409 (E0131, E0402, ...) could follow a partial
+              ; write, and 404 is unexpected: both stay :info.
+              (or (= 400 s) (and (= 409 s) (= "ZC-E0105" (code res))))
+              (assoc op :type :fail :error [s (code res)])
+              ; Everything else, 5xx included: the store may have committed.
               :else (assoc op :type :info :error [s (code res)]))))
         (catch Exception e
           (assoc op

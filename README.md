@@ -19,8 +19,8 @@ Two tests on the same cluster and the same fault schedule.
 |------------|------------|
 | Nodes      | 5 Docker containers `n1`..`n5` (Ubuntu 24.04), each with its own network namespace, on bridge `10.77.0.0/24`. Jepsen runs on the host and drives them over SSH. |
 | Postgres   | `n1`: Postgres 16 primary. `n2`: synchronous streaming standby (`synchronous_standby_names = '*'`, `synchronous_commit = remote_apply`, the setup Zigcube's `docs/operations.md` supports). |
-| Faults     | A loop of: random-halves partition of all 5 nodes (iptables) for 8 s, heal, **failover** (SIGKILL the primary, promote the standby), then **rejoin** (re-seed the old primary with `pg_basebackup` as the new synchronous standby). |
-| Checkers   | Knossos linearizability (`:linear`) per key; a timeline per key; a sanity check that fails the run if any op kind never succeeded or fewer than `--min-failovers` failovers completed, so the test cannot pass vacuously. |
+| Faults     | A loop of: random-halves partition of all 5 nodes (iptables) for 8 s, heal, **failover** (SIGKILL the primary, check no postgres process is left on it, then promote the standby; if the old primary is not confirmed stopped the op fails and nothing is promoted), then **rejoin** (re-seed the old primary with `pg_basebackup` as the new synchronous standby). After the load: heal, rejoin, 15 s settle, then **final reads** (two per key, retried until `:ok`) of every key that was used. |
+| Checkers   | Knossos linearizability (`:linear`) per key, final reads included; a timeline per key; a sanity check that fails the run if any op kind never succeeded, fewer than `--min-failovers` failovers completed, a failover failed, any op saw `ZC-E0215` (Zigcube's halt on a detected lost write, answered `502`), or a key that got final reads got no `:ok` one. |
 
 **`--workload api`** (`zcube-register-api`, the default): through Zigcube.
 
@@ -33,10 +33,15 @@ Two tests on the same cluster and the same fault schedule.
   `replicas: v+1`; `read` is `GET /v1/list?prefix=/services/r<key>x`. There
   is no compare-and-set op, so the model is a plain register. The agents
   really start and stop the fake containers the writes ask for.
-- `200` is `:ok`. `400` and `409` (ZC-E0105, the server's compare kept
-  failing) are `:fail`, as is a request that never connected. Any other
-  failure of a write, a timeout or a `503` included, is `:info`: it may have
-  committed. A failed read is `:fail`.
+- `200` is `:ok`. `400`, and `409` only with ZC-E0105 (the server's compare
+  kept failing), are `:fail`, as is a request that never connected. Any other
+  failure of a write is `:info`, since it may have committed: a timeout, a
+  `503`, a `404`, or a `409` with another code. A failed read is `:fail`.
+- Write values are a per-key counter (0, 1, 2, ...), never repeated within a
+  key, so a read names the exact write it saw and a rollback past an
+  acknowledged write cannot be explained by an `:info` write of the same
+  value. (The `pg` workload keeps its small value domain because its CAS ops
+  need values that can match.)
 - Zigcube has no multi-host connection string; the operator repoints the
   store's address after a failover. Here that address is the name `pg` in
   `n3`'s `/etc/hosts`, which the failover nemesis rewrites after promoting.
@@ -119,16 +124,23 @@ clock-offset test hook in the binaries, or KVM guests with their own clocks.
   update between two writers, only stale or impossible reads.
 - **Only the apply and list paths of the server are exercised.** Agents run
   and are told to start containers, but nothing checks what they did.
-- **Failover is fenced.** The nemesis kills the old primary before promoting.
-  An unfenced failover (old primary alive behind a partition, still serving
-  reads) is the interesting case for the fencing inequality and is not run.
+- **No unfenced failover.** The nemesis kills the old primary and checks it
+  stopped before promoting. An unfenced failover (old primary alive behind a
+  partition, still serving reads) is the interesting case for the fencing
+  inequality and is not run.
 - **Partitions do not cut clients off.** Clients run on the control host,
   which is never partitioned from the nodes. A partition separates the
   server from Postgres, the agents from the server, or primary from standby,
   depending on how the random halves fall.
 - **No clock faults and no SIGSTOP in the test**, only the probe.
 - **No negative control.** There is no run that is expected to fail, so the
-  checker has not been shown to catch a real violation in this setup.
+  checker has not been shown to catch a real violation in this setup. It
+  would be a third job with `synchronous_commit = off` and no
+  `synchronous_standby_names` (an async standby), so a failover loses
+  acknowledged writes, run with the same fault schedule and a job that
+  passes only if the run comes out invalid: `:linear` `false` or the sanity
+  check failing on `ZC-E0215`. Until it exists, "linearizable" means only
+  that no violation was observable.
 - **The api workload has run only in CI.** The session that wrote it could
   not build Zigcube locally (its Zigbox dependency could not be fetched
   there).

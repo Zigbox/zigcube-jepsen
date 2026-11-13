@@ -1,9 +1,8 @@
 (ns zcube-jepsen.register
-  "Compare-and-set registers, one row per key.
-
-  Slice 1 talks to Postgres directly (the store under zcube-server). The
-  zcube-server HTTP client plugs in here behind the same op shapes; see
-  docs/plan.md."
+  "Compare-and-set registers, one row per key, straight on the Postgres pair
+  (the store under zcube-server) over JDBC. This is the `pg` workload: it
+  tests the store alone and does not touch zcube-server. The client that goes
+  through zcube-server's HTTP API is in zcube-jepsen.api."
   (:require [clojure.tools.logging :refer [info warn]]
             [jepsen [client :as client]
                     [independent :as independent]]

@@ -29,6 +29,8 @@ jobs:
         workload: [api, pg]
     env:
       LEIN_VERSION: "2.11.2"
+      # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.
+      LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
       # Zigbox/zigcube main, 2026-11-12.
       ZIGCUBE_COMMIT: f7736a72f85c8ea21c1359c69a19539e00f0a5b9
       ZIG_VERSION: "0.17.0"
@@ -83,6 +85,7 @@ jobs:
         run: |
           mkdir -p bin
           curl -fsSL -o bin/lein "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein"
+          echo "${LEIN_SHA256}  bin/lein" | sha256sum -c -
           chmod +x bin/lein
           bin/lein version
 
