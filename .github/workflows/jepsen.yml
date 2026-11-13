@@ -2,7 +2,7 @@ name: jepsen
 
 on:
   push:
-    branches: [main, claude/harness]
+    branches: [main, claude/harness, claude/jepsen-1b]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   register:
-    name: register / ${{ matrix.workload }} / partitions + failover
+    name: register / ${{ matrix.workload }} / ${{ matrix.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -27,6 +27,19 @@ jobs:
       matrix:
         # api: through zcube-server. pg: the Postgres pair alone.
         workload: [api, pg]
+        # fenced: the supported failover; must find nothing.
+        # unfenced: promote with the old primary still up; must find no lost
+        #   write (a ZC-E0215 halt is an allowed ending).
+        # negative-control: an asynchronous standby, cut off before a fenced
+        #   promotion; passes only if the checkers catch the lost writes.
+        mode: [fenced, unfenced, negative-control]
+        include:
+          - mode: fenced
+            mode_args: --failover fenced
+          - mode: unfenced
+            mode_args: --failover unfenced
+          - mode: negative-control
+            mode_args: --replication async --failover lagged --expect lost-write
     env:
       LEIN_VERSION: "2.11.2"
       # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.
@@ -92,6 +105,10 @@ jobs:
       - name: Fetch dependencies
         run: bin/lein deps
 
+      - name: Unit tests
+        if: matrix.mode == 'fenced'
+        run: bin/lein test
+
       - name: Start 5 nodes
         run: docker/up.sh
 
@@ -105,9 +122,11 @@ jobs:
             --ssh-private-key docker/.ssh/id_ed25519 \
             --time-limit "$TIME_LIMIT" \
             --concurrency 10 \
-            --min-failovers 2 > jepsen-stdout.log 2>&1 && rc=0 || rc=$?
+            --min-failovers 2 \
+            ${{ matrix.mode_args }} > jepsen-stdout.log 2>&1 && rc=0 || rc=$?
           # The full log is in the artifact; show the nemesis trace and verdict.
           grep -E 'jepsen.util :nemesis' jepsen-stdout.log | cut -c1-220 || true
+          grep -E 'write outage per failover' jepsen-stdout.log | cut -c1-300 || true
           tail -n 25 jepsen-stdout.log
           exit "$rc"
 
@@ -115,7 +134,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jepsen-store-${{ matrix.workload }}
+          name: jepsen-store-${{ matrix.workload }}-${{ matrix.mode }}
           path: |
             store/
             jepsen-stdout.log
