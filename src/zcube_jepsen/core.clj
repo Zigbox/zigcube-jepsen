@@ -92,7 +92,16 @@
                          (filter #(some #{"ZC-E0215"} (error-codes %)))
                          (map #(select-keys % [:index :process :f :type :error]))
                          (take 5))
-            final   (filter :final history)
+            ; Final reads: client ops after the :final-phase nemesis op. (Not
+            ; marked on the ops: an extra key on an op corrupts how Knossos
+            ; reads the per-key histories.)
+            start   (or (->> history
+                             (filter #(and (= :nemesis (:process %))
+                                           (= :final-phase (:f %))))
+                             (map :index) first)
+                        Long/MAX_VALUE)
+            final   (filter #(and (number? (:process %)) (> (:index %) start))
+                            history)
             final-keys    (->> final (filter #(= :invoke (:type %)))
                                (map #(first (:value %))) set)
             final-ok-keys (->> final (filter #(= :ok (:type %)))
@@ -113,56 +122,60 @@
          :final-reads-ok    (count (filter #(= :ok (:type %)) final))
          :final-read-keys-without-ok (vec final-missing)}))))
 
+(defn final-phase-nemesis
+  "Handles :final-phase: flips `final?` so `retrying` knows the final reads
+  have started, and marks their start in the history."
+  [final?]
+  (reify nemesis/Nemesis
+    (setup! [this test] this)
+    (invoke! [_ test op] (reset! final? true) (assoc op :value :started))
+    (teardown! [_ test])))
+
 (defn retrying
-  "Wraps a client so a final read that does not return :ok is retried (the
-  cluster may still be settling) a bounded number of times."
-  [c]
+  "Wraps a client so that, once `final?` is set, a read that does not return
+  :ok is retried (the cluster may still be settling) a bounded number of
+  times."
+  [c final?]
   (reify client/Client
-    (open! [_ test node] (retrying (client/open! c test node)))
+    (open! [_ test node] (retrying (client/open! c test node) final?))
     (setup! [this test] (client/setup! c test) this)
     (invoke! [_ test op]
       (loop [tries 0]
         (let [res (client/invoke! c test op)]
-          (if (and (:final op) (not= :ok (:type res)) (< tries 14))
+          (if (and @final? (not= :ok (:type res)) (< tries 14))
             (do (Thread/sleep 2000) (recur (inc tries)))
             res))))
     (teardown! [_ test] (client/teardown! c test))
     (close! [_ test] (client/close! c test))))
 
 (defn final-reads
-  "A generator of two :final reads per key in `keys*` (an atom of every key a
-  worker was given), after heal and settle. The key set is read on the first
-  call, i.e. when the phase starts, so it sees every key. A plain stateful
-  function, not a delay or independent/concurrent-generator: those were
-  journaled with untupled invokes and no completions, which broke the
-  per-key histories."
+  "Two reads of every key a worker was ever given, after heal and settle. The
+  key range is taken when the phase starts (a delay, and a lazy take-while),
+  not when the generator is built, so it sees every key; keys are the
+  contiguous prefix of (range) that the main phase consumed."
   [keys*]
-  (let [q (atom nil)]
-    (fn [_ _]
-      (swap! q #(or % (vec (mapcat (fn [k] [k k]) @keys*))))
-      (loop []
-        (let [cur @q]
-          (when (seq cur)
-            (if (compare-and-set! q cur (subvec cur 1))
-              {:type :invoke :f :read :final true
-               :value (independent/tuple (first cur) nil)}
-              (recur))))))))
+  (delay
+    (independent/concurrent-generator
+      2 (take-while #(contains? @keys* %) (range))
+      (fn [_] (gen/limit 2 (repeat {:type :invoke :f :read :value nil}))))))
 
 (defn register-test
   [opts]
   (let [state (atom nil)
         keys* (atom (sorted-set))   ; every key a worker was ever given
+        final? (atom false)
         wl    (workloads (:workload opts))]
     (merge tests/noop-test
            opts
            {:name      (:name wl)
             :os        os/noop
             :db        ((:db wl))
-            :client    (retrying ((:client wl)))
+            :client    (retrying ((:client wl)) final?)
             :nemesis   (nemesis/compose
                          {{:start-partition :start
                            :stop-partition  :stop} (nemesis/partition-random-halves)
-                          #{:failover :rejoin}     (pg/failover-nemesis state (:on-promote wl))})
+                          #{:failover :rejoin}     (pg/failover-nemesis state (:on-promote wl))
+                          #{:final-phase}          (final-phase-nemesis final?)})
             :checker   (checker/compose
                          {:linear (independent/checker
                                     (checker/compose
@@ -187,6 +200,7 @@
                          (gen/log "Letting the cluster settle")
                          (gen/nemesis (gen/sleep 15))
                          (gen/log "Final reads of every key")
+                         (gen/nemesis {:type :info :f :final-phase})
                          (gen/clients (final-reads keys*)))})))
 
 (def cli-opts
