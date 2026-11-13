@@ -4,38 +4,37 @@ Slices after the first. Each names what it adds, what it checks, and what it
 needs. Invariant names (I1a..I7, J1..J11, the fencing inequality) refer to
 Zigcube's `docs/authority.md` and job documentation.
 
-> Written without access to the Zigcube repository (see README, "What is not
-> covered yet"). Invariants and findings are referred to by the names given in
-> the brief; their exact statements, and any detail of how a finding
-> reproduces, must be filled in from `docs/authority.md`, `docs/api.md`,
-> `docs/agent.md` and issues #237 and #238 before the slice is built. Items
+> Issues #237 and #238 could not be read from the session that wrote this
+> (its GitHub access covers only this repository, and no document in the
+> Zigcube tree quotes them). What each finding says, and how it reproduces,
+> must be filled in from the issues before slices 3 to 5 are built. Items
 > marked **(to confirm)** are assumptions.
 
-## Slice 1b: finish slice 1 against `zcube-server`
+## Slice 1b: remainder
 
-Blocked only on read access to `Zigbox/zigcube`.
+Done: CI builds Zigcube at a pinned commit; `zcube-server` on `n3`, agents on
+`n4`, `n5`; the register goes through `POST /v1/apply` and `GET /v1/list`; the
+Postgres-only test is a second job. Left:
 
-1. CI: check out Zigcube at a pinned commit of `main`, build `zcube-server`
-   and `zcube-agent` as `AGENTS.md` describes, copy the binaries into the
-   nodes. If the repository is private, the workflow needs a read-only deploy
-   key or token as an Actions secret.
-2. Deployment: `zcube-server` on `n3` pointed at the Postgres pair; agents
-   with FakeRuntime on `n4`, `n5`. Decide how the server finds the primary
-   after failover (multi-host connection string, or a restart by the nemesis)
-   from how `pg_dev` does it.
-3. Client: replace the JDBC client in `register.clj` with an HTTP client for
-   the register (compare-and-set) surface in `docs/api.md`, keeping the same
-   `read` / `write` / `cas` op shapes so generator and checker are unchanged.
-   Map responses carefully: only a response that proves the op did not happen
-   is `:fail`; timeouts and 5xx are `:info`.
-4. Run clients from inside the cluster or add the control host to the
-   partition grudge, so that partitions cut clients from the server and the
-   server from Postgres, not only primary from standby.
-5. Keep the direct-to-Postgres test as a second job: when the HTTP test
-   fails, it tells store faults from server faults.
-6. Negative control: a run with `synchronous_commit = local` on the client
-   sessions, or an unfenced failover, that is expected to be non-linearizable,
-   to show the checker catches it here.
+1. **Partitions that cut clients off.** Clients run on the control host,
+   which no partition includes. Run them inside the cluster, or add the
+   control host to the grudge.
+2. **A compare-and-set op.** The API has none, so the model is a plain
+   register. `/v1/list` returns `mod_revision`; a read that carries it turns
+   the history into a versioned register, which Elle can check more cheaply
+   and more precisely than Knossos.
+3. **Unfenced failover.** Promote the standby while the old primary is alive
+   behind a partition and the server still points at it. `docs/operations.md`
+   says the server remembers the highest revision in `--state-dir` and halts
+   with ZC-E0215 on a store that went backwards; this is the run that tests
+   it. With `synchronous_commit = remote_apply` the old primary cannot
+   acknowledge a write alone, so the expected result is stalls, not loss.
+4. **Negative control.** A run expected to fail (asynchronous standby, which
+   Zigcube documents as unsupported, plus failover), to show the checker
+   catches a real loss here.
+5. **How the server takes a failover.** The nemesis rewrites the `pg` name on
+   `n3` and does not restart the server. Record from the logs whether the
+   server reconnects by itself and how long writes fail.
 
 ## Slice 2: leases and fencing (I1b, measuring overlap)
 
@@ -45,15 +44,26 @@ Blocked only on read access to `Zigbox/zigcube`.
 - Faults: partition an agent from the server, and the server from Postgres,
   for longer than the lease.
 - Checkers:
-  - at most one live assignment per slot at any point in the server's
-    history (from the API and from the store);
-  - no two running copies of a replica beyond the I1b window, computed from
+  - **I1a**: at every revision each replica id has at most one assignment
+    (`/assigned/<node>/...` read with `GET /v1/list?at=<revision>`, and from
+    the store after the run). No fault exempts this one;
+  - **I1b**: a replaced replica's old instance and its replacement do not
+    both run for longer than `lost_grace_ms` plus kill latency, computed from
     the agents' start/stop records collected after the run, not from the
-    server's view. Report the measured maximum overlap, not only pass/fail;
-  - the fencing inequality, with the bounds actually configured.
-- Needs: a common time base for records from different nodes. Without clock
-  faults the containers share the host clock, so raw timestamps compare
-  directly. Record `CLOCK_MONOTONIC` as well; it is also shared.
+    server's view. Report the measured maximum overlap, not only pass/fail.
+    A replacement has a new replica id, so the pairing of old and new comes
+    from the server's decisions;
+  - the fencing inequality with the constants actually configured:
+    `fence_margin >= fence_stop_ms + ttl * skew + kill latency` (defaults:
+    `ttl` 10 s, `fence_stop_ms` 2 s, `skew` 1 %, `fence_margin` 3 s,
+    `lost_grace_ms` 1 s). The agent fences at `s + ttl - fence_margin` on
+    `CLOCK_BOOTTIME`, where `s` is when it sent its last successful
+    keepalive.
+- Needs: a common time base for records from different nodes. The containers
+  share the host's clocks, so timestamps compare directly. The fake runtime
+  keeps one `zcube-agent supervise <dir>` process per container; whether its
+  state directory already holds usable start and stop times, or a watcher on
+  the node must record them, is the first thing to find out.
 
 ## Slice 3: clock steps (#238 finding 3)
 
@@ -62,6 +72,12 @@ Blocked only on read access to `Zigbox/zigcube`.
 - First task: establish whether libfaketime affects the Zigcube binaries at
   all (static linking, raw syscalls, vDSO; see README). If not, choose
   between a test-only clock offset in the binaries and KVM guests.
+- The agent's fencing deadline is on `CLOCK_BOOTTIME` and the inequality
+  bounds clock **rate** skew, not absolute values. A wall-clock step should
+  therefore change nothing, and the fault that matters is a rate change
+  (`faketime -f '+0 x1.05'`) with `FAKETIME_DONT_FAKE_MONOTONIC` off, if
+  libfaketime reaches `CLOCK_BOOTTIME` at all. Neither is a clock a container
+  can change for real.
 - Checker: slice 2's overlap checker. Records must carry both the faked wall
   clock and the true monotonic clock so overlap is measured in real time.
 - Expected: reproduces finding 3 **(to confirm against the issue)**.
@@ -73,25 +89,37 @@ Blocked only on read access to `Zigbox/zigcube`.
   resumes believing it still holds the lease.
 - Checker: overlap from the agents' records; FakeRuntime must timestamp a
   "still running" heartbeat record so a resumed copy is visible.
+- `docs/authority.md` already states that the I1b bound fails for a wedged
+  node ("the agent is frozen") and that nothing on the server can know. So an
+  overlap here is the documented limit; the run measures how long it lasts
+  after SIGCONT, and checks that I1a still holds throughout.
 - Expected: reproduces finding 4 **(to confirm against the issue)**.
 
 ## Slice 5: the stale register PUT (#237)
 
-- Workload: the register workload of slice 1b, plus a client that is delayed
-  (its request held by a partition or by SIGSTOP of a proxy) so that its PUT
-  arrives after newer writes.
-- Checker: linearizability with Knossos; if the API exposes versions, also
-  Elle's list-append or rw-register over versioned writes for a cheaper,
-  more precise anomaly report.
-- Expected: a non-linearizable history showing #237 **(to confirm)**.
+- "Register" here is most likely the agent's node registration,
+  `PUT /v1/agent/nodes/{node}`, not the register workload **(to confirm)**:
+  a registration from an old tenure that arrives after a newer one.
+- Workload: an agent client driven by the test (or a real agent behind a
+  proxy that can hold a request), delayed by a partition or SIGSTOP so its
+  PUT arrives after the node registered again.
+- Checker: I1a's second half, at most one tenure per node under which an
+  observation is admissible, and I2, no transaction commits under a
+  superseded tenure, read from the store's history.
+- Expected: a history showing #237 **(to confirm)**.
 
 ## Slice 6: jobs (J1..J11)
 
 - Workload: submit, cancel and observe jobs through the API under all of the
   above faults.
-- Checkers: each of J1..J11 that can be decided from API responses and agent
-  records. List, per invariant, whether it is observable from outside; the
-  ones that are not stay with the in-tree checker (`src/testing/history.zig`).
+- Checkers: each of J1..J11 (`docs/core.md`) that can be decided from API
+  responses and agent records. From outside: J1 (no job container alive more
+  than `overlap_ms_max` after its job is terminal), J3 (a terminal status
+  never changes), J4 (a watcher of `GET /v1/jobs/watch` that is killed and
+  resumed misses no ending), J5, J6 and J8 (bounds on how long a container
+  outlives its stop or deadline). J7 (each start has a committed claim) needs
+  the store. The rest stay with the in-tree checker
+  (`src/testing/history.zig`) unless the issue text says otherwise.
 
 ## Cross-cutting
 
