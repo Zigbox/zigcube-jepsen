@@ -115,24 +115,29 @@ each. The `api` workload did **not** run locally: building Zigcube was not
 allowed in that sandbox, so the api runs (and ZC-E0215 under an unfenced
 failover) were checked only in CI.
 
-**CI result** (run 43432518018, PR #2, head `fb8f4e5`, 120 s per run): all
-six jobs green, `lein test` green. These numbers predate the review fixes
-(store-log check, the stricter negative control, the outage origin); the
-table is replaced once CI has run on them.
+**CI result** (run 43441912526, PR #2, head `ec813a1`, 120 s per run):
+all eight jobs green, `lein test` green. Outage counts only writes issued
+after the promotion finished, measured from the start of the failover.
 
-| workload | mode | verdict | write outage per failover (ms) |
-|---|---|---|---|
-| api | fenced | valid, no halt | 4684 to 5314 (4 failovers) |
-| api | unfenced | valid, **no** ZC-E0215 halt | 9488 to 9851 (4) |
-| api | negative control | caught by Elle and ZC-E0215 (server halted) | 207 (the only failover that recovered before the halt) |
-| pg | fenced | valid | 12, 4397, 9, 4499; one of 5 never recovered before the run ended |
-| pg | unfenced | valid | 9384 to 9793 (4) |
-| pg | negative control | caught by Knossos and Elle | - |
+| workload | mode | verdict | caught by (loss evidence) | write outage per failover (ms) |
+|---|---|---|---|---|
+| api | fenced | valid, no halt | - | 4361 to 4428 (4); 1 of 5 never recovered |
+| api | unfenced | valid, **no** ZC-E0215 halt | - | 9715 to 11858 (4) |
+| api | unfenced-async | lost write, server halted | Elle (`:off-chain`, `:beyond-store`) | 5207 (1); 3 of 4 never recovered (halt) |
+| api | negative control | lost write, server halted | Elle (`:off-chain`, `:beyond-store`) | none recovered (4 of 4, halt) |
+| pg | fenced | valid | - | 4296 to 4336 (4); 1 of 5 never recovered |
+| pg | unfenced | valid | - | 9421 to 9575 (4) |
+| pg | unfenced-async | lost write | Knossos and Elle (`:version-conflicts`, `:beyond-store`) | 5175 to 5291 (4) |
+| pg | negative control | lost write | Knossos and Elle (`:version-conflicts`, `:beyond-store`) | 4367 to 4691 (4) |
 
-So unfenced failover with sync replication ended in stalls (about 9.5 s,
-up to the rejoin) and never in a halt; as item 3 explains, sync replication
-rules out a lost acknowledged write there by construction. The ZC-E0215
-path was exercised only by the negative control.
+The halt alone no longer counts: both api lost-write runs were caught by
+Elle from the store-log chain check, with the halt reported apart.
+
+So unfenced failover with sync replication ended in stalls (about 9.5 to
+12 s, up to the rejoin) and never in a halt; as item 3 explains, sync
+replication rules out a lost acknowledged write there by construction.
+The ZC-E0215 path was exercised by the negative control and by
+`unfenced-async`.
 
 Open:
 - `:writes-ok-after` used to count a write acknowledged on the old primary
@@ -141,10 +146,11 @@ Open:
   promotion finished count.
 - api: a lost write at or below the log's compaction point is not
   detectable from the store; `:unverifiable` counts the ops this affects.
-- pg fenced in CI had one failover marked `:never-recovered` (no write
-  issued after it was acknowledged before the next failover or the end).
-  Not a safety problem (Elle and Knossos pass), but worth a look in the
-  artifact `jepsen-store-pg-fenced` if it recurs.
+- pg fenced and api fenced in CI each had one failover of 5 marked
+  `:never-recovered` (no write issued after it was acknowledged before the
+  next failover or the end). Not a safety problem (Elle and Knossos pass);
+  it recurred, so check in the `jepsen-store-*-fenced` artifacts whether
+  it is always the last failover, cut off by the end of the run.
 - Sync unfenced does not exercise split brain (item 3). `unfenced-async`
   now does, with an expected loss. Still open (review of PR #2): recording
   which node served each op, with a `sanity` fact that the unfenced window

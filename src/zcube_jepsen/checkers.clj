@@ -348,7 +348,7 @@
                          :indeterminate    (count (filter #(= :info (:type %)) window))}))
             outs    (keep :writes-ok-after per)]
         (info "write outage per failover (ms from the failover's start to the"
-              "first ack of a write issued after it):" (vec outs))
+              "first ack of a write issued after the promotion finished):" (vec outs))
         {:valid?       true      ; a measurement, not a check
          :failovers    per
          :writes-ok-after-ms {:min  (when (seq outs) (reduce min outs))
