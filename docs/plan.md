@@ -10,7 +10,7 @@ Zigcube's `docs/authority.md` and job documentation.
 > must be filled in from the issues before slices 3 to 5 are built. Items
 > marked **(to confirm)** are assumptions.
 
-## Slice 1b: remainder (done on `claude/jepsen-1b`, CI to confirm)
+## Slice 1b: remainder (done on `claude/jepsen-1b`, green in CI)
 
 Done before: CI builds Zigcube at a pinned commit; `zcube-server` on `n3`,
 agents on `n4`, `n5`; the register goes through `POST /v1/apply` and
@@ -65,6 +65,22 @@ each. The `api` workload did **not** run locally: building Zigcube was not
 allowed in that sandbox, so the api runs (and ZC-E0215 under an unfenced
 failover) were checked only in CI.
 
+**CI result** (run 43432518018, PR #2, head `fb8f4e5`, 120 s per run): all
+six jobs green, `lein test` green.
+
+| workload | mode | verdict | write outage per failover (ms) |
+|---|---|---|---|
+| api | fenced | valid, no halt | 4684 to 5314 (4 failovers) |
+| api | unfenced | valid, **no** ZC-E0215 halt | 9488 to 9851 (4) |
+| api | negative control | caught by Elle and ZC-E0215 (server halted) | 207 (the only failover that recovered before the halt) |
+| pg | fenced | valid | 12, 4397, 9, 4499; one of 5 never recovered before the run ended |
+| pg | unfenced | valid | 9384 to 9793 (4) |
+| pg | negative control | caught by Knossos and Elle | - |
+
+So unfenced failover, as scheduled here, ended in stalls (about 9.5 s,
+the repoint delay plus the rejoin) and never in lost writes or a halt; the
+ZC-E0215 path was exercised only by the negative control.
+
 Open:
 - The api negative control depends on Zigcube's state dir catching the
   loss (ZC-E0215) or the clients seeing it; if the server halts before any
@@ -72,7 +88,16 @@ Open:
   a pass but says less.
 - `:writes-ok-after` can count a write acknowledged in the few ms before
   the nemesis's iptables rule landed (seen: 11 ms in one unfenced
-  failover). Read it together with `:gap`.
+  failover; in CI, 12 and 9 ms in two pg fenced failovers). Read it
+  together with `:gap`.
+- pg fenced in CI had one failover marked `:never-recovered` (no write
+  issued after it was acknowledged before the next failover or the end).
+  Not a safety problem (Elle and Knossos pass), but worth a look in the
+  artifact `jepsen-store-pg-fenced` if it recurs.
+- Unfenced did not provoke a halt: with a 5 s repoint delay the old
+  primary is cut off from clients, so it takes no writes to diverge on. A
+  schedule that lets clients keep writing to the old primary during the
+  delay would be the stronger test.
 
 ## Slice 2: leases and fencing (I1b, measuring overlap)
 

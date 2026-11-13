@@ -69,7 +69,13 @@ each: fenced valid (write outage 4.3 to 4.7 s per failover), unfenced valid
 (up to 9.3 s), negative control valid, i.e. the loss was caught by Knossos
 and Elle. With a synchronous pair the outage lasts until the old primary has
 rejoined as standby, not until promotion. The `api` workload was not run
-locally (see `docs/plan.md`, slice 1b); CI numbers to follow.
+locally (see `docs/plan.md`, slice 1b).
+
+CI (run 43432518018, 120 s each), all six jobs green: api fenced valid
+(outage 4.7 to 5.3 s), api unfenced valid with no `ZC-E0215` halt (9.5 to
+9.9 s), api negative control caught by Elle and by a `ZC-E0215` halt; pg
+fenced valid (up to 4.5 s), pg unfenced valid (9.4 to 9.8 s), pg negative
+control caught by Knossos and Elle.
 
 Before slice 1b:
 
