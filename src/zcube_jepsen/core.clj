@@ -129,6 +129,25 @@
     (teardown! [_ test] (client/teardown! c test))
     (close! [_ test] (client/close! c test))))
 
+(defn final-reads
+  "A generator of two :final reads per key in `keys*` (an atom of every key a
+  worker was given), after heal and settle. The key set is read on the first
+  call, i.e. when the phase starts, so it sees every key. A plain stateful
+  function, not a delay or independent/concurrent-generator: those were
+  journaled with untupled invokes and no completions, which broke the
+  per-key histories."
+  [keys*]
+  (let [q (atom nil)]
+    (fn [_ _]
+      (swap! q #(or % (vec (mapcat (fn [k] [k k]) @keys*))))
+      (loop []
+        (let [cur @q]
+          (when (seq cur)
+            (if (compare-and-set! q cur (subvec cur 1))
+              {:type :invoke :f :read :final true
+               :value (independent/tuple (first cur) nil)}
+              (recur))))))))
+
 (defn register-test
   [opts]
   (let [state (atom nil)
@@ -168,14 +187,7 @@
                          (gen/log "Letting the cluster settle")
                          (gen/nemesis (gen/sleep 15))
                          (gen/log "Final reads of every key")
-                         ; Built when this phase starts, so it sees every key.
-                         (gen/clients
-                           (delay
-                             (independent/concurrent-generator
-                               2 (vec @keys*)
-                               (fn [_]
-                                 (repeat 2 {:type :invoke :f :read
-                                            :value nil :final true}))))))})))
+                         (gen/clients (final-reads keys*)))})))
 
 (def cli-opts
   [[nil "--workload NAME" "pg (the store alone) or api (through zcube-server)."
