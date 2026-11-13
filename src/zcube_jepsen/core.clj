@@ -11,6 +11,8 @@
             [jepsen.checker.timeline :as timeline]
             [knossos.model :as model]
             [zcube-jepsen [api :as api]
+                          [checkers :as checkers]
+                          [nemesis :as zn]
                           [postgres :as pg]
                           [register :as register]
                           [zcube :as zcube]]))
@@ -27,6 +29,18 @@
   []
   (let [n (atom -1)]
     (fn [_ _] {:type :invoke :f :write :value (swap! n inc)})))
+
+(defn unique-ops
+  "Writes and cas ops whose new values are never repeated within one key (call
+  it once per key). A cas expects the latest value handed out or the one
+  before it, so a fair share of them succeed."
+  []
+  (let [n (atom -1)]
+    [(fn [_ _] {:type :invoke :f :write :value (swap! n inc)})
+     (fn [_ _] (let [cur @n
+                     old (if (and (pos? cur) (< (rand) 0.3)) (dec cur) cur)]
+                 {:type :invoke :f :cas
+                  :value [(max old 0) (swap! n inc)]}))]))
 
 (defn nemesis-schedule
   "Partition, heal, fail over, rejoin; repeat."
@@ -47,80 +61,21 @@
   {"pg"  {:name       "zcube-register-pg"
           :db         pg/db
           :client     register/client
-          :ops        (fn [] [r w cas])   ; cas needs a small value domain
+          :ops        (fn [] (cons r (unique-ops)))
           :fs         [:read :write :cas]
           :model      model/cas-register
-          :on-promote nil}
+          :on-promote nil
+          :store-sql  register/store-sql
+          :parse-store register/parse-store-rows}
    "api" {:name       "zcube-register-api"
           :db         zcube/db
           :client     api/client
           :ops        (fn [] [r (unique-writes)])
           :fs         [:read :write]
           :model      model/register
-          :on-promote zcube/on-promote}})
-
-(defn error-codes
-  "Every string inside an op's :error, so a code is found whatever the shape."
-  [op]
-  (filter string? (tree-seq coll? seq (:error op))))
-
-(defn sanity-checker
-  "Guards against a vacuous pass. The run fails unless:
-  - it completed operations of every kind in `fs`;
-  - at least `min-failovers` failovers completed, and none failed (the old
-    primary was not confirmed stopped, or the promotion threw);
-  - no op saw ZC-E0215: Zigcube halts with it when it detects that a
-    failover lost committed writes, and answers every later call 502, which
-    the register client records as :info/:fail, so Knossos cannot see it;
-  - every key that got a final read (after heal, rejoin and a settle) got at
-    least one :ok final read, so a loss cannot hide behind a key that was
-    never read again."
-  [fs min-failovers]
-  (reify checker/Checker
-    (check [_ test history opts]
-      (let [oks  (->> history
-                      (filter #(and (= :ok (:type %)) (number? (:process %))))
-                      (map :f) frequencies)
-            nem  (fn [f] (filter #(and (= :nemesis (:process %)) (= f (:f %))
-                                       (= :info (:type %))
-                                       (some? (:value %)))
-                                 history))
-            fos  (count (filter #(= :promoted (first (:value %))) (nem :failover)))
-            bad-fos (filter #(= :failover-failed (first (:value %))) (nem :failover))
-            rejoins (count (filter #(= :rejoined (first (:value %))) (nem :rejoin)))
-            halted  (->> history
-                         (filter #(some #{"ZC-E0215"} (error-codes %)))
-                         (map #(select-keys % [:index :process :f :type :error]))
-                         (take 5))
-            ; Final reads: client ops after the :final-phase nemesis op. (Not
-            ; marked on the ops: an extra key on an op corrupts how Knossos
-            ; reads the per-key histories.)
-            start   (or (->> history
-                             (filter #(and (= :nemesis (:process %))
-                                           (= :final-phase (:f %))))
-                             (map :index) first)
-                        Long/MAX_VALUE)
-            final   (filter #(and (number? (:process %)) (> (:index %) start))
-                            history)
-            final-keys    (->> final (filter #(= :invoke (:type %)))
-                               (map #(first (:value %))) set)
-            final-ok-keys (->> final (filter #(= :ok (:type %)))
-                               (map #(first (:value %))) set)
-            final-missing (sort (remove final-ok-keys final-keys))]
-        {:valid?    (boolean (and (every? #(pos? (get oks % 0)) fs)
-                                  (<= min-failovers fos)
-                                  (empty? bad-fos)
-                                  (empty? halted)
-                                  (seq final-keys)
-                                  (empty? final-missing)))
-         :ok-counts oks
-         :failovers fos
-         :failover-failures (map :value bad-fos)
-         :rejoins   rejoins
-         :halted-ops (vec halted)
-         :final-read-keys   (count final-keys)
-         :final-reads-ok    (count (filter #(= :ok (:type %)) final))
-         :final-read-keys-without-ok (vec final-missing)}))))
+          :on-promote zcube/on-promote
+          :store-sql  api/store-sql
+          :parse-store api/parse-store-rows}})
 
 (defn final-phase-nemesis
   "Handles :final-phase: flips `final?` so `retrying` knows the final reads
@@ -173,17 +128,21 @@
             :client    (retrying ((:client wl)) final?)
             :nemesis   (nemesis/compose
                          {{:start-partition :start
-                           :stop-partition  :stop} (nemesis/partition-random-halves)
-                          #{:failover :rejoin}     (pg/failover-nemesis state (:on-promote wl))
+                           :stop-partition  :stop} (zn/partition-nemesis)
+                          #{:failover :rejoin :store-read}
+                          (pg/failover-nemesis state (:on-promote wl)
+                                               (:store-sql wl))
                           #{:final-phase}          (final-phase-nemesis final?)})
-            :checker   (checker/compose
+            :checker   (checkers/verdict
                          {:linear (independent/checker
                                     (checker/compose
                                       {:linear   (checker/linearizable
                                                    {:model     ((:model wl))
                                                     :algorithm :linear})
                                        :timeline (timeline/html)}))
-                          :sanity (sanity-checker (:fs wl) (:min-failovers opts))})
+                          :elle   (checkers/versioned-register (:parse-store wl))
+                          :outage (checkers/outage)
+                          :sanity (checkers/sanity (:fs wl) (:min-failovers opts))})
             :generator (gen/phases
                          (->> (independent/concurrent-generator
                                 2 (range)
@@ -201,7 +160,9 @@
                          (gen/nemesis (gen/sleep 15))
                          (gen/log "Final reads of every key")
                          (gen/nemesis {:type :info :f :final-phase})
-                         (gen/clients (final-reads keys*)))})))
+                         (gen/clients (final-reads keys*))
+                         (gen/log "Reading the store directly")
+                         (gen/nemesis {:type :info :f :store-read}))})))
 
 (def cli-opts
   [[nil "--workload NAME" "pg (the store alone) or api (through zcube-server)."
@@ -215,7 +176,31 @@
    [nil "--ops-per-key N" "Operations per independent key."
     :default 60 :parse-fn parse-long]
    [nil "--min-failovers N" "Fail the run if fewer failovers completed."
-    :default 1 :parse-fn parse-long]])
+    :default 1 :parse-fn parse-long]
+   [nil "--failover MODE"
+    (str "fenced: stop the old primary, then promote. unfenced: cut the pair"
+         " apart and promote with the old primary still up, clients still"
+         " pointed at it for --repoint-delay-ms. lagged: cut the pair apart"
+         " for --lag-ms, then fence and promote (only loses writes with"
+         " --replication async).")
+    :default :fenced :parse-fn keyword
+    :validate [#{:fenced :unfenced :lagged} "must be fenced, unfenced or lagged"]]
+   [nil "--replication MODE"
+    "sync (remote_apply, the supported setup) or async (the negative control)."
+    :default :sync :parse-fn keyword
+    :validate [#{:sync :async} "must be sync or async"]]
+   [nil "--expect OUTCOME"
+    (str "valid: the run must find nothing. lost-write: the negative control;"
+         " the run passes only if the checkers catch a loss.")
+    :default :valid :parse-fn keyword
+    :validate [#{:valid :lost-write} "must be valid or lost-write"]]
+   [nil "--repoint-delay-ms N" "unfenced: how long clients stay on the old primary."
+    :default 5000 :parse-fn parse-long]
+   [nil "--lag-ms N" "lagged: how long the standby is cut off before promotion."
+    :default 4000 :parse-fn parse-long]
+   [nil "--[no-]client-partition"
+    "Put the control host (the clients) on one side of every partition."
+    :default true]])
 
 (defn -main [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn  register-test

@@ -11,7 +11,12 @@
   (v+1 so the register's 0 does not depend on what a service of no replicas
   means.)
 
-  There is no cas op in this workload."
+  There is no cas op in this workload.
+
+  Every :ok op carries :version, the store revision of the value it wrote or
+  read: an apply answers the revision it wrote at, which is the service key's
+  `mod_revision`, and a list answers the key's `mod_revision` (0: no such
+  key). So the history is a versioned register (zcube-jepsen.checkers)."
   (:require [cheshire.core :as json]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [client :as client]
@@ -83,7 +88,8 @@
                             (filter #(= (str "/services/" name) (:key %)))
                             first)]
                 (assoc op :type :ok
-                       :value (independent/tuple k (some-> kv :value :replicas dec))))
+                       :value (independent/tuple k (some-> kv :value :replicas dec))
+                       :version (or (:mod_revision kv) 0)))
               (assoc op :type :fail :error [(:status res) (code res)])))
 
           :write
@@ -95,7 +101,9 @@
                               :applied_by "jepsen"})
                 s   (:status res)]
             (cond
-              (= 200 s) (assoc op :type :ok)
+              ; :version nil if the answer has no revision (action
+              ; "none": cannot happen with values never repeated).
+              (= 200 s) (assoc op :type :ok :version (-> res :body :revision))
               ; Refused before or instead of writing: 400 invalid, or 409
               ; ZC-E0105 (the compare kept failing, so nothing was written).
               ; Any other 409 (E0131, E0402, ...) could follow a partial
@@ -113,3 +121,21 @@
   (close! [this test]))
 
 (defn client [] (Client. nil nil))
+
+(def store-sql
+  "The final store read, straight from Postgres: every register service as
+  key, mod_revision, value (the service record's JSON). Zigcube's tables are
+  in schema zcube (store_postgres.zig)."
+  (str "SELECT key, mod_revision, convert_from(value, 'UTF8')"
+       " FROM zcube.store_live WHERE key LIKE '/services/r%x' ORDER BY key"))
+
+(defn parse-store-rows
+  "store-sql's rows as {k [v version]}."
+  [rows]
+  (into {}
+        (for [[key rev value] rows
+              :let [[_ k] (re-matches #"/services/r(\d+)x" key)]
+              :when k]
+          [(parse-long k)
+           [(some-> (json/parse-string value true) :replicas dec)
+            (parse-long rev)]])))
