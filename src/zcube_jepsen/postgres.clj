@@ -292,8 +292,19 @@
 
           :store-read
           (try
-            (assoc op :value {:node primary
-                              :rows (store-rows test primary store-sql)})
+            ; From the true current primary: `state` follows the nemesis's
+            ; own promotions, so check that the node is not in recovery.
+            (let [rec (-> (c/on-nodes test [primary]
+                                      (fn [_ _]
+                                        (pg! :psql :-h primary :-U :jepsen
+                                             :-d :jepsen :-Atc
+                                             "SELECT pg_is_in_recovery()")))
+                          (get primary) str/trim)]
+              (if (not= "f" rec)
+                (assoc op :value [:store-read-failed primary
+                                  (str "pg_is_in_recovery: " rec)])
+                (assoc op :value {:node primary
+                                  :rows (store-rows test primary store-sql)})))
             (catch Exception e
               (warn e "store read failed")
               (assoc op :value [:store-read-failed primary (.getMessage e)]))))))

@@ -18,6 +18,19 @@
   reported here as :version-conflicts and :value-conflicts, and fail the
   check (a store that went back and re-used a version does that).
 
+  That last guard needs per-key versions. pg's are (the row's counter); api's
+  are not: `mod_revision` is the store's global revision, and after a store
+  goes back, writes to other keys move it past a lost write's revision before
+  the key is written again, so no version is re-used and the lost write would
+  be spliced into the order. So the api store read also returns the key's
+  history as the surviving store kept it (Zigcube's `store_log`, which the
+  server compacts to its last 1000 revisions), the :chains. Above the
+  compaction point the chain, not the observations, decides the order, and an
+  acknowledged write or read of a [k version value] that is not on it is
+  reported as :off-chain and fails the check: the surviving store never had
+  it. Observations at or below the compaction point cannot be checked that
+  way and are counted as :unverifiable.
+
   Values must never repeat within a key (core's unique-writes)."
   (:require [clojure.tools.logging :refer [info warn]]
             [elle.list-append :as la]
@@ -33,15 +46,20 @@
 ;; The final store read
 
 (defn store-read
-  "The :store-read nemesis op's rows, parsed with `parse` into
-  {k [v version]}, or nil if there was none or it failed."
+  "The :store-read nemesis op's rows, parsed with `parse`, or nil if there was
+  none or it failed. `parse` returns either {k [v version]} (the live rows)
+  or {:live {k [v version]}, :chains {k {version v}}, :compacted rev}; the
+  result is always the second shape (:chains nil when the store has none)."
   [history parse]
   (when-let [op (->> history
                      (filter #(and (= :nemesis (:process %))
                                    (= :store-read (:f %))
                                    (map? (:value %))))
                      last)]
-    (parse (:rows (:value op)))))
+    (let [p (parse (:rows (:value op)))]
+      (if (contains? p :live)
+        p
+        {:live p :chains nil :compacted nil}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Version orders
@@ -64,7 +82,34 @@
             :cas   [[k (dec ver) (first v)] [k ver (second v)]]
             :read  [[k ver v]])))
       (filter #(and (client-op? %) (= :ok (:type %)) (:version %)) history))
-    (for [[k [v ver]] store] [k ver v])))
+    (for [[k [v ver]] (:live store)] [k ver v])
+    (for [[k chain] (:chains store) [ver v] chain] [k ver v])))
+
+(defn off-chain
+  "With the store's :chains: splits the client observations [k version value]
+  into {:off-chain [...] :unverifiable n}. Off chain: above the compaction
+  point, and not on the key's chain. Unverifiable: at or below it, and not
+  the entry the compaction kept. Without :chains: nil."
+  [client-obs {:keys [chains compacted]}]
+  (when chains
+    (let [c (or compacted 0)
+          on? (fn [[k ver v]] (= v (get-in chains [k ver] ::none)))
+          [low high] ((juxt filter remove) (fn [[_ ver _]] (<= ver c))
+                      (remove (fn [[_ ver _]] (zero? ver)) client-obs))]
+      {:off-chain    (vec (distinct (remove on? high)))
+       :unverifiable (count (distinct (remove on? low)))})))
+
+(defn surviving-obs
+  "The observations that make the version order: with :chains, the chain
+  entries and whatever is at or below the compaction point (off-chain ones
+  are left out, so they cannot be spliced in); without, all of them."
+  [obs {:keys [chains compacted]}]
+  (if chains
+    (let [c (or compacted 0)]
+      (filter (fn [[k ver v]]
+                (or (<= ver c) (= v (get-in chains [k ver] ::none))))
+              obs))
+    obs))
 
 (defn version-orders
   "Returns {:orders {k (sorted-map version value)}, :version-conflicts [...],
@@ -140,7 +185,7 @@
                    :value (mapv (fn [k] [:r k nil]) keys)}
                   {:type :ok :process p :time (inc t) :f :txn
                    :value (mapv (fn [k]
-                                  (let [[v ver] (get store k [nil 0])]
+                                  (let [[v ver] (get (:live store) k [nil 0])]
                                     [:r k (if (zero? ver)
                                             []
                                             (prefix orders k ver v))]))
@@ -154,7 +199,9 @@
   (reify checker/Checker
     (check [_ test history opts]
       (let [store  (store-read history parse)
-            vo     (version-orders (observations history store))
+            obs    (observations history store)
+            chain  (off-chain (observations history nil) store)
+            vo     (version-orders (surviving-obs obs store))
             eh     (elle-history history (:orders vo) store)
             dir    (.getCanonicalPath
                      (store/path! test (:subdirectory opts) "elle"))
@@ -167,10 +214,16 @@
                           (assoc (la/check models eh)
                                  :plots-failed (.getMessage e))))
             conflicts? (or (seq (:version-conflicts vo))
-                           (seq (:value-conflicts vo)))]
+                           (seq (:value-conflicts vo))
+                           (seq (:off-chain chain)))]
         (merge res
                {:valid? (if conflicts? false (:valid? res))
                 :store-read? (some? store)
+                :chains? (some? (:chains store))
+                :compacted (:compacted store)
+                :off-chain (take 10 (:off-chain chain))
+                :off-chain-count (count (:off-chain chain))
+                :unverifiable (:unverifiable chain)
                 :keys (count (:orders vo))
                 :version-conflicts (take 10 (:version-conflicts vo))
                 :value-conflicts   (take 10 (:value-conflicts vo))})))))
@@ -213,16 +266,19 @@
   "For every failover that promoted: how long writes failed. Times are ms from
   the start of the failover op.
 
-  :writes-ok-after  when the first write issued after the failover began was
-                    acknowledged (nil: none was, before the run ended). This
-                    is the number to quote: no write issued in that window
-                    succeeded.
-  :gap             the longest stretch around the failover with no write
-                    acknowledged at all: from the last ack before it to the
-                    first ack after.
+  :writes-ok-after  when the first write issued after the promotion finished
+                    was acknowledged (nil: none was, before the run ended),
+                    measured from the failover's start. This is the number
+                    to quote. Writes issued between the start and the
+                    promotion's end do not count: one can still commit on
+                    the old primary before the fence lands, and its ack says
+                    nothing about the new one.
+  :gap             the longest stretch between two consecutive write acks
+                    (of any write, whenever issued) from the last ack before
+                    the failover to that first ack after the promotion.
   :promoted, :rejoined  when the promotion and the rejoin finished.
-  :failed, :indeterminate  writes issued in the window that failed, or
-                    timed out."
+  :failed, :indeterminate  writes issued from the failover's start until that
+                    first ack that failed, or timed out."
   []
   (reify checker/Checker
     (check [_ test history opts]
@@ -236,7 +292,7 @@
             per     (vec
                       (for [{:keys [start end value]} fos
                             :let [first-ok (->> oks
-                                                (filter #(<= start (:invoke-time %)))
+                                                (filter #(<= end (:invoke-time %)))
                                                 (map :complete-time)
                                                 (reduce min Long/MAX_VALUE))
                                   first-ok (when (< first-ok Long/MAX_VALUE) first-ok)
@@ -255,7 +311,12 @@
                          :rejoined         (some-> rejoin (- start) ms)
                          :writes-ok-after  (some-> first-ok (- start) ms)
                          :gap              (when (and first-ok (<= 0 last-ok))
-                                             (ms (- first-ok last-ok)))
+                                             (let [acks (->> oks
+                                                             (map :complete-time)
+                                                             (filter #(< last-ok % first-ok))
+                                                             sort)
+                                                   ts   (concat [last-ok] acks [first-ok])]
+                                               (ms (reduce max (map - (rest ts) ts)))))
                          :failed           (count (filter #(= :fail (:type %)) window))
                          :indeterminate    (count (filter #(= :info (:type %)) window))}))
             outs    (keep :writes-ok-after per)]
@@ -357,13 +418,16 @@
     worked, and either every finally-read key got an :ok read, or the server
     halted with ZC-E0215 where that is an allowed ending: only with
     :failover :unfenced, where the old primary may have made a commit visible
-    that the promoted standby never got. A halt is never a pass by itself: the
-    store read still has to show every acknowledged write (Elle).
+    that the promoted standby never got. A halt is never a pass by itself:
+    Elle must still pass, and for api that includes the store chain check
+    (every acknowledged write above the compaction point is on the surviving
+    store's history of its key).
 
   :expect :lost-write (the negative control)
-    The run is not vacuous, and something caught the loss: Knossos or Elle
-    found a violation, or the server halted with ZC-E0215. Valid means the
-    checkers have teeth here."
+    The run is not vacuous, and Knossos or Elle found a violation. A ZC-E0215
+    halt is reported (:halted?) but does not count: it is Zigcube catching
+    the loss, and the control is there to show that the checkers do. Valid
+    means the checkers have teeth here."
   [checkers]
   (let [inner (checker/compose checkers)]
     (reify checker/Checker
@@ -379,11 +443,11 @@
               finals? (empty? (:final-read-keys-without-ok sanity))
               caught  (cond-> []
                         (false? linear) (conj :knossos)
-                        (false? elle)   (conj :elle)
-                        halted?         (conj :zc-e0215))]
+                        (false? elle)   (conj :elle))]
           (assoc r
                  :expected (:expect test :valid)
                  :caught-by caught
+                 :halted? (boolean halted?)
                  :valid?
                  (case (:expect test :valid)
                    :valid

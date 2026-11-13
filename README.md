@@ -59,8 +59,8 @@ Both use 10 workers, 2 per key, 60 ops per key.
 | Mode | Options | Valid when |
 |---|---|---|
 | fenced | `--failover fenced` (default) | Knossos and Elle pass, not vacuous, store read worked, every finally-read key got an `:ok` read, no op saw `ZC-E0215` (Zigcube's halt when the store went back past a revision it had seen, answered `502`). |
-| unfenced | `--failover unfenced` | The same, except a `ZC-E0215` halt is an allowed ending (then the final reads are waived; Elle on the store read must still pass). The pair is cut apart, the standby promoted with the old primary alive, clients and `zcube-server` repointed only after `--repoint-delay-ms` (5000). |
-| negative control | `--replication async --failover lagged --expect lost-write` | Not vacuous, and Knossos, Elle or a `ZC-E0215` halt caught a loss (`:caught-by`). The standby is asynchronous and cut off for `--lag-ms` (4000) before a fenced promotion, so acknowledged writes are lost. |
+| unfenced | `--failover unfenced` | The same, except a `ZC-E0215` halt is an allowed ending (then the final reads are waived; Elle must still pass, which for api includes every acknowledged write above the store log's compaction point being on the surviving store's history of its key). As configured neither side can commit while the pair is apart, so this mode shows stalls, not split brain. The pair is cut apart, the standby promoted with the old primary alive, clients and `zcube-server` repointed only after `--repoint-delay-ms` (5000). |
+| negative control | `--replication async --failover lagged --expect lost-write` | Not vacuous, and Knossos or Elle caught a loss (`:caught-by`). A `ZC-E0215` halt is reported as `:halted?` but does not count. The standby is asynchronous and cut off for `--lag-ms` (4000) before a fenced promotion, so acknowledged writes are lost. |
 
 ### Last result
 
@@ -75,7 +75,8 @@ CI (run 43432518018, 120 s each), all six jobs green: api fenced valid
 (outage 4.7 to 5.3 s), api unfenced valid with no `ZC-E0215` halt (9.5 to
 9.9 s), api negative control caught by Elle and by a `ZC-E0215` halt; pg
 fenced valid (up to 4.5 s), pg unfenced valid (9.4 to 9.8 s), pg negative
-control caught by Knossos and Elle.
+control caught by Knossos and Elle. (Before the PR #2 review fixes; see
+`docs/plan.md`.)
 
 Before slice 1b:
 

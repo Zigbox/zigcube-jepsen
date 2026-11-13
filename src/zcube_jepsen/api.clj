@@ -123,19 +123,36 @@
 (defn client [] (Client. nil nil))
 
 (def store-sql
-  "The final store read, straight from Postgres: every register service as
-  key, mod_revision, value (the service record's JSON). Zigcube's tables are
-  in schema zcube (store_postgres.zig)."
-  (str "SELECT key, mod_revision, convert_from(value, 'UTF8')"
-       " FROM zcube.store_live WHERE key LIKE '/services/r%x' ORDER BY key"))
+  "The final store read, straight from Postgres (Zigcube's tables are in
+  schema zcube, store_postgres.zig), as rows of kind+key, revision, value:
+    live <key>   every register service: its mod_revision and value (the
+                 service record's JSON)
+    log <key>    every put of it the store's log still has: its revision and
+                 value. The server compacts the log to its last 1000
+                 revisions, keeping the latest put of a key at or below that.
+    compacted    the compaction point (value empty)"
+  (str "SELECT 'live ' || key, mod_revision, convert_from(value, 'UTF8')"
+       " FROM zcube.store_live WHERE key LIKE '/services/r%x'"
+       " UNION ALL"
+       " SELECT 'log ' || key, revision, convert_from(value, 'UTF8')"
+       " FROM zcube.store_log WHERE key LIKE '/services/r%x' AND NOT deleted"
+       " UNION ALL"
+       " SELECT 'compacted', compacted_revision, ''"
+       " FROM zcube.store_meta WHERE id = 1"
+       " ORDER BY 1, 2"))
 
 (defn parse-store-rows
-  "store-sql's rows as {k [v version]}."
+  "store-sql's rows as {:live {k [v version]}, :chains {k {version v}},
+  :compacted rev} (zcube-jepsen.checkers/store-read)."
   [rows]
-  (into {}
-        (for [[key rev value] rows
-              :let [[_ k] (re-matches #"/services/r(\d+)x" key)]
-              :when k]
-          [(parse-long k)
-           [(some-> (json/parse-string value true) :replicas dec)
-            (parse-long rev)]])))
+  (let [value (fn [json] (some-> (json/parse-string json true) :replicas dec))
+        parsed (for [[kind rev v] rows
+                     :let [[_ what k] (re-matches #"(live|log) /services/r(\d+)x" kind)]]
+                 (cond
+                   (= "compacted" kind) [:compacted nil (parse-long rev) nil]
+                   k [(keyword what) (parse-long k) (parse-long rev) (value v)]))]
+    {:live      (into {} (for [[w k rev v] parsed :when (= :live w)] [k [v rev]]))
+     :chains    (reduce (fn [m [w k rev v]]
+                          (if (= :log w) (assoc-in m [k rev] v) m))
+                        {} parsed)
+     :compacted (some (fn [[w _ rev _]] (when (= :compacted w) rev)) parsed)}))

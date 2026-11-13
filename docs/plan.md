@@ -27,26 +27,43 @@ agents on `n4`, `n5`; the register goes through `POST /v1/apply` and
    reads the store straight from the current primary. The history becomes
    an Elle list-append history (a read at version n reads every value up to
    n), checked for strict serializability; a version seen with two values,
-   or a value at two versions, fails the check as well. Knossos stays on as
-   a cross-check. The API still has no compare-and-set, so the api model
+   or a value at two versions, fails the check as well. api versions are
+   the store's **global** revision, so a lost write is not caught that way:
+   after the store goes back, other keys move the revision past it, and the
+   lost write would be spliced into the order (review of PR #2). So the api
+   store read also reads each register key's history from Zigcube's
+   `store_log`; above the log's compaction point (the server keeps 1000
+   revisions) the surviving chain decides the order, and an acknowledged
+   write or read not on it fails the check (`:off-chain`). Below it, such
+   ops are counted as `:unverifiable`. Knossos stays on as a cross-check. The API still has no compare-and-set, so the api model
    stays a plain register; pg cas ops now use unique values too.
 3. **Unfenced failover.** Done: `--failover unfenced`. The pair is cut
    apart, the standby promoted with the old primary alive, and clients (and
    `zcube-server`) repointed only after `--repoint-delay-ms` (5 s). The
-   verdict allows a ZC-E0215 halt only in this mode, and even then the store
-   read must hold every acknowledged write (Elle) and Knossos must pass.
+   verdict allows a ZC-E0215 halt only in this mode, and even then Elle and
+   Knossos must pass. For pg that means the store read holds every
+   acknowledged write; for api it means so for every acknowledged write
+   above the log's compaction point (item 2).
+   As configured, this mode cannot lose an acknowledged write for a
+   structural reason: the promoted standby inherits
+   `synchronous_standby_names = '*'` and has no standby until the rejoin, and
+   the old primary has lost its, so neither side can commit. It shows that
+   writes stall; it does not exercise split brain (see Open).
    Local pg run: valid, no halt (pg has no server to halt).
 4. **Negative control.** Done: `--replication async --failover lagged
    --expect lost-write`. The standby is asynchronous and cut off for
    `--lag-ms` (4 s) before a fenced promotion, so writes acknowledged in
    that window are lost. The run is valid only if it is not vacuous and
-   Knossos, Elle or a ZC-E0215 halt caught the loss. Local pg run: caught
+   Knossos or Elle caught the loss. A ZC-E0215 halt is reported
+   (`:halted?`) but does not count: the control shows that the checkers
+   catch the loss, not that Zigcube does. Local pg run: caught
    by both Knossos and Elle (G-single-item, G0-realtime, G1c,
    incompatible-order; versions re-used for two values).
 5. **Measure the outage.** Done: the `:outage` checker. Per failover, ms
-   from its start to the first acknowledgement of a write issued after it
-   started, the longest stretch with no write acknowledged, and when the
-   promotion and the rejoin finished. Local pg numbers: fenced 4.3 to
+   from its start to the first acknowledgement of a write issued after the
+   promotion finished (an earlier write can still commit on the old
+   primary), the longest stretch between consecutive write acks, and when
+   the promotion and the rejoin finished. Local pg numbers: fenced 4.3 to
    4.7 s; unfenced 9.3 s for the failover whose writes were in flight.
    With `synchronous_standby_names = '*'`, the promoted primary cannot
    commit until a standby is back, so the outage ends at the **rejoin**
@@ -66,7 +83,9 @@ allowed in that sandbox, so the api runs (and ZC-E0215 under an unfenced
 failover) were checked only in CI.
 
 **CI result** (run 43432518018, PR #2, head `fb8f4e5`, 120 s per run): all
-six jobs green, `lein test` green.
+six jobs green, `lein test` green. These numbers predate the review fixes
+(store-log check, the stricter negative control, the outage origin); the
+table is replaced once CI has run on them.
 
 | workload | mode | verdict | write outage per failover (ms) |
 |---|---|---|---|
@@ -82,22 +101,25 @@ the repoint delay plus the rejoin) and never in lost writes or a halt; the
 ZC-E0215 path was exercised only by the negative control.
 
 Open:
-- The api negative control depends on Zigcube's state dir catching the
-  loss (ZC-E0215) or the clients seeing it; if the server halts before any
-  read shows the loss, `:caught-by` is `[:zc-e0215]` alone, which is still
-  a pass but says less.
-- `:writes-ok-after` can count a write acknowledged in the few ms before
-  the nemesis's iptables rule landed (seen: 11 ms in one unfenced
-  failover; in CI, 12 and 9 ms in two pg fenced failovers). Read it
-  together with `:gap`.
+- `:writes-ok-after` used to count a write acknowledged on the old primary
+  before the fence landed (12 and 9 ms in two pg fenced failovers, 207 ms
+  in the api negative control). Fixed: only writes issued after the
+  promotion finished count.
+- api: a lost write at or below the log's compaction point is not
+  detectable from the store; `:unverifiable` counts the ops this affects.
 - pg fenced in CI had one failover marked `:never-recovered` (no write
   issued after it was acknowledged before the next failover or the end).
   Not a safety problem (Elle and Knossos pass), but worth a look in the
   artifact `jepsen-store-pg-fenced` if it recurs.
-- Unfenced did not provoke a halt: with a 5 s repoint delay the old
-  primary is cut off from clients, so it takes no writes to diverge on. A
-  schedule that lets clients keep writing to the old primary during the
-  delay would be the stronger test.
+- Unfenced does not exercise split brain (item 3): neither side can
+  commit. Two follow-ups (review of PR #2): a variant in which the promoted
+  node drops `synchronous_standby_names` (the operator's emergency step), so
+  that it commits while the old primary is alive; and recording which node
+  served each op, with a `sanity` fact that the unfenced window actually
+  served ops from the old primary. Note that a Postgres commit waiting on
+  its sync standby is already visible to other sessions on that node, so
+  the variant may show reads of writes that are later lost; that would be
+  a finding about the setup, not a checker bug.
 
 ## Slice 2: leases and fencing (I1b, measuring overlap)
 
