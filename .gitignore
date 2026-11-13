@@ -1,0 +1,8 @@
+/target/
+/store/
+/.lein-*
+/.nrepl-port
+/bin/lein
+*.log
+/docker/.ssh/
+/zigcube

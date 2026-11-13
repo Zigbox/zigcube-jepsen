@@ -1,0 +1,129 @@
+name: jepsen
+
+on:
+  push:
+    branches: [main, claude/harness]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      time_limit:
+        description: Seconds of load and faults
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  register:
+    name: register / ${{ matrix.workload }} / partitions + failover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # api: through zcube-server. pg: the Postgres pair alone.
+        workload: [api, pg]
+    env:
+      LEIN_VERSION: "2.11.2"
+      # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.
+      LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
+      # Zigbox/zigcube main, 2026-11-12.
+      ZIGCUBE_COMMIT: f7736a72f85c8ea21c1359c69a19539e00f0a5b9
+      ZIG_VERSION: "0.17.0"
+      # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
+      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      TIME_LIMIT: ${{ inputs.time_limit || '120' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out Zigcube
+        if: matrix.workload == 'api'
+        uses: actions/checkout@v4
+        with:
+          repository: Zigbox/zigcube
+          ref: ${{ env.ZIGCUBE_COMMIT }}
+          path: zigcube
+
+      - name: Cache the Zigcube build
+        if: matrix.workload == 'api'
+        id: zcube
+        uses: actions/cache@v4
+        with:
+          path: zigcube/zig-out/bin
+          key: zigcube-${{ env.ZIGCUBE_COMMIT }}-zig-${{ env.ZIG_VERSION }}-ReleaseSafe-baseline
+
+      - name: Build Zigcube
+        if: matrix.workload == 'api' && steps.zcube.outputs.cache-hit != 'true'
+        run: |
+          archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+          echo "${ZIG_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpq-dev libsqlite3-dev
+          cd zigcube
+          "${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}/zig" build -Doptimize=ReleaseSafe -Dcpu=baseline
+          ls -l zig-out/bin
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: lein-${{ env.LEIN_VERSION }}-${{ hashFiles('project.clj') }}
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p bin
+          curl -fsSL -o bin/lein "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein"
+          echo "${LEIN_SHA256}  bin/lein" | sha256sum -c -
+          chmod +x bin/lein
+          bin/lein version
+
+      - name: Fetch dependencies
+        run: bin/lein deps
+
+      - name: Start 5 nodes
+        run: docker/up.sh
+
+      - name: Probe fault primitives
+        run: docker/check-faults.sh
+
+      - name: Run register test
+        run: |
+          bin/lein run test \
+            --workload "${{ matrix.workload }}" \
+            --ssh-private-key docker/.ssh/id_ed25519 \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency 10 \
+            --min-failovers 2 > jepsen-stdout.log 2>&1 && rc=0 || rc=$?
+          # The full log is in the artifact; show the nemesis trace and verdict.
+          grep -E 'jepsen.util :nemesis' jepsen-stdout.log | cut -c1-220 || true
+          tail -n 25 jepsen-stdout.log
+          exit "$rc"
+
+      - name: Upload store
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-store-${{ matrix.workload }}
+          path: |
+            store/
+            jepsen-stdout.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Node logs on failure
+        if: failure()
+        run: |
+          for i in 1 2 3 4 5; do echo "== n$i"; docker logs "n$i" 2>&1 | tail -n 20; done
+          tail -n 60 store/latest/n3/server.log 2>/dev/null || true
