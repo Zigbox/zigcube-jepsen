@@ -1,0 +1,144 @@
+name: stale-put
+
+# Slice 5: a registration PUT that lands after a newer one (Zigbox/zigcube#237).
+# An expected-failure job, like the register job's negative control: with
+# --expect auto it passes while the bug shows (the stale registration commits
+# and is found in the store), passes if the server refuses the held PUT and
+# every check then holds (the bug fixed), and fails otherwise: the release
+# landed without a stale registration, or the run proved nothing (nothing
+# held, or the release came after the old lease had ended).
+
+on:
+  push:
+    branches: [main, claude/jepsen-5]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stale-put-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stale-put:
+    name: stale-put / ${{ matrix.variant }} (expected failure while zigcube#237 is open)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # running: the held PUT lands once n4 runs its replicas (#237 case a).
+        # registered: it lands right after n4 registered again, before the
+        #   apply (case b).
+        # idle: as registered, with nothing to run (#237's liveness note).
+        variant: [running, registered, idle]
+        include:
+          - variant: running
+            variant_args: --release-after running
+          - variant: registered
+            variant_args: --release-after registered
+          - variant: idle
+            variant_args: --release-after registered --services 0
+    env:
+      LEIN_VERSION: "2.11.2"
+      # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.
+      LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
+      # Zigbox/zigcube main, 2026-11-12 (the register job's pin).
+      ZIGCUBE_COMMIT: f7736a72f85c8ea21c1359c69a19539e00f0a5b9
+      ZIG_VERSION: "0.17.0"
+      # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
+      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out Zigcube
+        uses: actions/checkout@v4
+        with:
+          repository: Zigbox/zigcube
+          ref: ${{ env.ZIGCUBE_COMMIT }}
+          path: zigcube
+
+      - name: Cache the Zigcube build
+        id: zcube
+        uses: actions/cache@v4
+        with:
+          path: zigcube/zig-out/bin
+          key: zigcube-${{ env.ZIGCUBE_COMMIT }}-zig-${{ env.ZIG_VERSION }}-ReleaseSafe-baseline
+
+      - name: Build Zigcube
+        if: steps.zcube.outputs.cache-hit != 'true'
+        run: |
+          archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+          echo "${ZIG_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpq-dev libsqlite3-dev
+          cd zigcube
+          "${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}/zig" build -Doptimize=ReleaseSafe -Dcpu=baseline
+          ls -l zig-out/bin
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: lein-${{ env.LEIN_VERSION }}-${{ hashFiles('project.clj') }}
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p bin
+          curl -fsSL -o bin/lein "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein"
+          echo "${LEIN_SHA256}  bin/lein" | sha256sum -c -
+          chmod +x bin/lein
+          bin/lein version
+
+      - name: Fetch dependencies
+        run: bin/lein deps
+
+      - name: Unit tests (stale-put)
+        if: matrix.variant == 'running'
+        run: bin/lein test zcube-jepsen.stale-put-test
+
+      - name: Start 5 nodes
+        run: docker/up.sh
+
+      # The agent on n4 reaches zcube-server through a proxy on the runner,
+      # at the bridge's gateway; let the bridge reach it.
+      - name: Open the hold proxy's port to the nodes
+        run: sudo iptables -I INPUT -s 10.77.0.0/24 -p tcp --dport 17070 -j ACCEPT
+
+      - name: Run stale-put test
+        run: |
+          bin/lein run -m zcube-jepsen.stale-put test \
+            --ssh-private-key docker/.ssh/id_ed25519 \
+            --expect auto \
+            ${{ matrix.variant_args }} > jepsen-stdout.log 2>&1 && rc=0 || rc=$?
+          grep -E 'jepsen.util :nemesis' jepsen-stdout.log | grep -v ':collect' | cut -c1-260 || true
+          sed -n '/jepsen.core {/,$p' jepsen-stdout.log | grep -vE ':body|known_hash' | tail -n 60
+          exit "$rc"
+
+      - name: Upload store
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-stale-put-${{ matrix.variant }}
+          path: |
+            store/
+            jepsen-stdout.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Node logs on failure
+        if: failure()
+        run: |
+          for i in 1 2 3 4 5; do echo "== n$i"; docker logs "n$i" 2>&1 | tail -n 20; done
+          tail -n 60 store/latest/n3/server.log 2>/dev/null || true
+          tail -n 60 store/latest/n4/agent.log 2>/dev/null || true
