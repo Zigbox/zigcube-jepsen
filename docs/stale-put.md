@@ -17,9 +17,10 @@ Schedule (nemesis steps, recorded in `:steps`):
    was still at the server" case of #237.
 4. Depending on `--release-after`:
    - `running` (#237 case a): apply 3 single-replica services, wait until n4
-     runs them, then start n5 and release the held PUT.
-   - `registered` (case b): start n5 and release right after n4's second
-     registration, then apply.
+     runs them, then start n5, wait until it is registered and ready
+     (`:await-ready`), and release the held PUT.
+   - `registered` (case b): start n5, wait until it is ready, and release
+     right after n4's second registration, then apply.
    - `--services 0` with `registered` ("idle"): nothing to run (#237's
      liveness note).
 5. `:observe` for 30 s, then `:collect`. Collect reads the server's
@@ -28,7 +29,9 @@ Schedule (nemesis steps, recorded in `:steps`):
    proxy's request log.
 
 The release is sent while L1 is still live (the default ttl is 10 s), so a
-correct server must refuse it.
+correct server must refuse it. Every wait (`:await-registered`,
+`:await-running`, `:await-ready`) has a deadline; a wait that runs out, or a
+step that throws, makes the run vacuous.
 
 ## Checks (all in `stale_put.clj`, unit-tested in `stale_put_test.clj`)
 
@@ -41,29 +44,54 @@ correct server must refuse it.
   - The replay flags two admissible observations of one replica id, and
     observations written under a superseded tenure.
 - **Overlap:** from the agents' records, per service, the longest time two
-  replicas (an old and a new instance) were alive at once. **This is a
-  minimal overlap checker of slice 5's own**, made to keep clear of slice 2's
-  general one (`claude/jepsen-2`).
-  - A gap of 1 s or more in a replica's samples ends an interval.
+  replicas (an old and a new instance) may have been alive at once. **This
+  is a minimal overlap checker of slice 5's own**, made to keep clear of
+  slice 2's general one (`claude/jepsen-2`).
+  - A run of samples naming a replica is widened to the node's samples on
+    either side of it (the replica may have started just after the sample
+    before, and stopped just before the sample after).
+  - A gap between samples (the watcher stalled) is unknown, not absent: it
+    never splits a run.
+  - A replica is put in its service by its `/assigned` row, or, if it has
+    none in the log, by its id (`<service>-<n>`).
   - The containers share the host clock.
 - **Liveness:**
   - How long n4 was `lost` at the end of the run.
-  - Keepalives on L2 that the server answered 200 after the stale PUT landed
-    ("orphan keepalives").
+  - "Orphan keepalives": renewals of one of n4's leases that the server
+    answered 200 after the release while `/nodes/n4`, replayed from the
+    store at the time of the answer, named another lease or none. (The time
+    of each `/nodes/n4` put is the `at_ms` of the node-status the server
+    wrote for that tenure.) A renewal of L3 after the agent registered on L3
+    is not one.
 - **Verdict:** `judge`, with `--expect auto|bug|valid`. The default is
   `auto`.
   - `:expected-failure-237` (passes): the release committed and left a stale
     registration in the store.
+  - `:expected-failure-237` needs the stale row to be the release's own
+    put: the revision its answer names, on L1.
   - `:fixed` (passes, but only if every check holds): the server refused the
-    release while L1 was live.
+    release while L1 was live. The refusal must be a 4xx answered before L1's
+    earliest possible end (grant request + ttl), not ZC-E0205, and either
+    carry a code in `refusal-codes` (ZC-E0105, ZC-E0510) or have left
+    `/nodes/n4` on L2's registration (read right after the answer). The run
+    must also be complete: collect worked, the store log starts at revision
+    1 with nothing compacted, L2's registration is in it, and every agent
+    node (and every node a replica was assigned to) has process samples.
+    Otherwise the checks could hold because there was nothing to check.
   - Fails: the release landed without a stale registration; the run is
-    vacuous (nothing held, or the refusal came because L1 had already ended);
-    or the fixed run broke a check.
+    vacuous (nothing held, a wait ran out, a 5xx, or a refusal that came
+    after L1 could have ended or does not show L2 kept); the fixed run was
+    incomplete; or it broke a check.
 
 ## Results at the CI pin (zigcube f7736a7)
 
-zigcube main fb385b2 still has `register` (`src/agent_api.zig`) applying the
-PUT with no compare, so #237 is open. Every local run gave
+These results were taken at f7736a7, the pin of the register job and of this
+workflow. zigcube main fb385b2 still has `register` (`src/agent_api.zig`)
+applying the PUT with no compare, so #237 is open there too, and the stale
+registration should land the same way. But fb385b2 changed how long the
+agent waits when it fences, so the timings below (how soon the agent's
+containers were killed after the fence, and so how soon the replacements
+started) describe f7736a7 only; they were not re-taken at fb385b2. Every local run gave
 `:valid? true, :outcome :expected-failure-237`. The histories are in
 `docs/stale-put/{running,registered,idle}.edn`, and the CI artifacts hold
 the same for each run.
@@ -92,7 +120,8 @@ What happened:
 - The stale write committed (rev 15).
 - The agent's next report, `POST .../observed?known=17`, was answered 503.
   The agent fenced itself (`ZC-W0501`, "lease 2 could not be kept"), and its
-  containers, which ignore TERM in this test, were KILLed about 2.5 s later.
+  containers, which ignore TERM in this test, were KILLed about 2.0 s later
+  (503 at ...369766, last sample alive at ...371765).
 - It then took a new lease and re-registered (rev 18; again unconditional).
   Every replica was replaced on n4 itself.
 - The I1a replay and the overlap check found nothing (overlap 0 ms), and the
@@ -100,14 +129,21 @@ What happened:
 
 So the overlap #237 predicts for case (a), about 5.9 s while L1 runs out,
 **did not happen at this pin**. What happened instead was a needless fence
-that restarted all of n4's work. That is a wrong outcome even though no
-invariant broke: the agent did nothing wrong and lost its work.
+that restarted all of n4's work. The fence is the designed response: the
+server's tenure compare refused the agent's report because its tenure (rev
+1) was no longer `/nodes/n4`'s (rev 15), the ZC-E0510 path, and the agent
+fences on that. It is needless only because the tenure change it reacts to
+was the stale registration itself: the agent did nothing wrong and lost its
+work. No invariant broke.
 
 ### registered (case b)
 
 `docs/stale-put/registered.edn`: the stale registration landed at rev 4.
-Once work was assigned, the agent fenced and re-registered on L3, as in case
-a. No overlap and no I1a violation.
+Once work was assigned, the agent fenced and re-registered on L3 (rev 15).
+Unlike case a, not every replica was replaced: sp0-1 and sp1-1 were killed
+and replaced by sp0-2 and sp1-2, but sp2-1 was only started after the agent
+had re-registered and ran to the end of the run. No overlap and no I1a
+violation.
 
 ### idle (case b with nothing to run)
 
@@ -122,11 +158,21 @@ a. No overlap and no I1a violation.
 This is #237's liveness note, reproduced: the node cannot come back until the
 agent restarts.
 
-This history's `:orphan-keepalives` is empty because of a path-matching bug in
-the check (it missed `?known=`). That bug was fixed after the run. In CI run
-43533838746, the idle variant counted 9 keepalives on L2 answered 200 after
-the stale PUT landed, and n4 was lost for 20358 ms. The running variant
-counted 8 before the agent fenced.
+The committed histories' `:orphan-keepalives` fields came from earlier
+versions of the check: the first missed `?known=` paths, and the one CI ran
+(run 43533838746) counted every renewal of a lease other than L1, including
+the legitimate renewals of L3 after the agent registered again (8 in
+running and in registered). Re-running the current check over the three
+committed histories gives:
+
+| variant | orphan keepalives | |
+|---|---|---|
+| running | 0 | every renewal after the release was of L3, after `/nodes/n4` named L3; the agent never renewed L2 after the release |
+| registered | 0 | the same |
+| idle | 9 | all of L2: 2 while `/nodes/n4` named L1, 7 after it was deleted |
+
+In CI run 43533838746 the idle variant counted 9 and n4 was lost for
+20358 ms.
 
 ## How to run it
 
@@ -156,7 +202,14 @@ CI: `.github/workflows/stale-put.yml` runs all three variants with
 
 - Only the restart path of #237 is driven. The broken-connection path (the
   agent's connection drops but its PUT is still in the server) is not.
-- Every run had the node's replicas placed back on n4. A schedule where n5
-  takes them (so that an old instance on n4 and a new one on n5 could
-  overlap) was not reached: n4 was always the only ready node when the apply
-  ran.
+- In all three committed histories n5 never registered: there is no
+  `/nodes/n5` or `/node-status/n5` row and no n5 process interval, so a
+  replacement on n5 was impossible and every replica went back on n4. The
+  harness started n5's agent with `--server n3:7070`, a name, while every
+  other agent start (zcube/start-agent!, and n4's through the proxy) passes
+  an IP address; n5 is now started with n3's IP. The step `:await-ready n5`
+  now waits for n5's registration and ready status and makes the run
+  vacuous if it does not come (and logs n5's agent log), so a run where n5
+  could not take the work no longer passes silently. Whether n5 then
+  takes the replicas, and whether an old instance on n4 overlaps a new one
+  on n5, is for the next CI run to show; these histories predate the fix.

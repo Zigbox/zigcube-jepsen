@@ -61,45 +61,84 @@
   "The agent's registration of `node`: PUT /v1/agent/nodes/<node>, exactly."
   [{:keys [method path]} node]
   (and (= "PUT" method)
-       (= (str "/v1/agent/nodes/" node) (first (str/split path #"\?")))))
+       (= (str "/v1/agent/nodes/" node) (first (str/split (str path) #"\?")))))
 
-(defn- read-body
-  "The body that follows a head: content-length bytes, or a chunked body up to
-  its last chunk."
-  ^bytes [^InputStream in {:keys [content-length chunked?]}]
+(defn- read-line-bytes
+  "Reads one CRLF-terminated line into `raw`; returns it without the CRLF,
+  or nil on EOF."
+  ^String [^InputStream in ^ByteArrayOutputStream raw]
+  (let [line (ByteArrayOutputStream.)]
+    (loop [prev -1]
+      (let [b (.read in)]
+        (cond
+          (neg? b) nil
+          :else (do (.write raw b)
+                    (if (and (= b 10) (= prev 13))
+                      (let [bs (.toByteArray line)]
+                        (String. bs 0 (max 0 (dec (alength bs))) StandardCharsets/ISO_8859_1))
+                      (do (.write line b) (recur b)))))))))
+
+(defn read-chunked
+  "Reads a chunked body (RFC 9112 7.1) through its last chunk and trailer.
+  Returns {:raw bytes-as-sent :data decoded-bytes}."
+  [^InputStream in]
+  (let [raw (ByteArrayOutputStream.)
+        data (ByteArrayOutputStream.)
+        eof #(throw (java.io.EOFException. "chunked body cut short"))]
+    (loop []
+      (let [line (or (read-line-bytes in raw) (eof))
+            size (Long/parseLong (str/trim (first (str/split line #";" 2))) 16)]
+        (if (zero? size)
+          ; Trailer fields, up to the empty line.
+          (loop [] (let [l (or (read-line-bytes in raw) (eof))]
+                     (when-not (str/blank? l) (recur))))
+          (let [bs (.readNBytes in (int size))]
+            (when (< (alength bs) size) (eof))
+            (.write raw bs) (.write data bs)
+            (when-not (= "" (read-line-bytes in raw)) (eof))
+            (recur)))))
+    {:raw (.toByteArray raw) :data (.toByteArray data)}))
+
+(defn read-body
+  "The body that follows a head: {:raw bytes-as-sent :data decoded-bytes}.
+  content-length bytes, a chunked body through its trailer, or nothing."
+  [^InputStream in {:keys [content-length chunked?]}]
   (cond
-    content-length (.readNBytes in (int content-length))
-    chunked?       (let [buf (ByteArrayOutputStream.)]
-                     (loop [last5 ""]
-                       (let [b (.read in)]
-                         (if (neg? b)
-                           (.toByteArray buf)
-                           (let [_ (.write buf b)
-                                 s (str (subs last5 (max 0 (- (count last5) 4)))
-                                        (char b))]
-                             (if (= s "0\r\n\r\n")
-                               (.toByteArray buf)
-                               (recur s)))))))
-    :else          (byte-array 0)))
+    chunked?       (read-chunked in)
+    content-length (let [bs (.readNBytes in (int content-length))]
+                     {:raw bs :data bs})
+    :else          {:raw (byte-array 0) :data (byte-array 0)}))
 
 (defn- pump!
-  "Copies in to out until EOF, calling (on-first bytes n) on the first read.
+  "Copies in to out until EOF, calling (on-data bytes n) on every read.
   Closes out's socket for writing at the end."
-  [^InputStream in ^OutputStream out on-first]
+  [^InputStream in ^OutputStream out on-data]
   (let [buf (byte-array 16384)]
-    (loop [first? true]
+    (loop []
       (let [n (try (.read in buf) (catch SocketException _ -1))]
         (when (pos? n)
-          (when first? (on-first buf n))
+          (on-data buf n)
           (when (try (.write out buf 0 n) (.flush out) true
                      (catch SocketException _ false))
-            (recur false)))))))
+            (recur)))))))
 
 (defn status-of
   "The status code at the start of an HTTP answer's bytes, or nil."
   [^bytes buf n]
   (let [s (String. buf 0 (int (min n 32)) StandardCharsets/ISO_8859_1)]
     (some-> (re-find #"^HTTP/1\.[01] (\d{3})" s) second parse-long)))
+
+(defn status-tracker
+  "An (on-data bytes n) for pump! that gathers the answer's first bytes,
+  however the reads split them, until `status` (an atom) is set."
+  [status]
+  (let [prefix (ByteArrayOutputStream.)]
+    (fn [^bytes buf n]
+      (when (and (nil? @status) (< (.size prefix) 32))
+        (.write prefix buf 0 (int (min n (- 32 (.size prefix)))))
+        (let [bs (.toByteArray prefix)]
+          (when-let [st (status-of bs (alength bs))]
+            (reset! status st)))))))
 
 (defn- log! [proxy entry] (swap! (:log proxy) conj entry))
 
@@ -115,12 +154,12 @@
         (.flush uo)
         (let [t (Thread. ^Runnable
                          (fn []
-                           (pump! (.getInputStream client) uo (fn [_ _]))
+                           (pump! (.getInputStream client) uo (fn [_ _] nil))
                            (try (.shutdownOutput up) (catch Exception _))))]
           (.setDaemon t true)
           (.start t)
           (pump! (.getInputStream up) (.getOutputStream client)
-                 (fn [buf n] (reset! status (status-of buf n))))))
+                 (status-tracker status))))
       (catch Exception e
         (reset! status [:error (.getName (class e))]))
       (finally
@@ -141,15 +180,14 @@
             held (:held proxy)]
         (if (and (registration? req-full (:node proxy))
                  (compare-and-set! (:armed proxy) true false))
-          (let [body (read-body in req-full)
-                all  (byte-array (+ (alength head) (alength body)))]
+          (let [{:keys [^bytes raw ^bytes data]} (read-body in req-full)
+                all  (byte-array (+ (alength head) (alength raw)))
+                text (String. data StandardCharsets/UTF_8)]
             (System/arraycopy head 0 all 0 (alength head))
-            (System/arraycopy body 0 all (alength head) (alength body))
-            (reset! held {:at t0 :bytes all :body (String. body StandardCharsets/UTF_8)
-                          :client client})
+            (System/arraycopy raw 0 all (alength head) (alength raw))
+            (reset! held {:at t0 :bytes all :body text :client client})
             (log! proxy (assoc req :at t0 :status :held))
-            (info "hold-proxy: holding" (:method req) (:path req)
-                  (String. body StandardCharsets/UTF_8)))
+            (info "hold-proxy: holding" (:method req) (:path req) text))
           ; The head may have been followed by body bytes already buffered in
           ; `in`; they are still in the stream, and the pump sends them on.
           (relay! proxy client head req t0))))))
@@ -198,14 +236,15 @@
         (.write o bytes)
         (.flush o)
         ; The server may keep the connection open after answering, so read
-        ; the head and then content-length bytes, not up to EOF.
+        ; the head and then the body by its framing, not up to EOF.
         (let [in     (.getInputStream s)
               head   (read-head in)
               _      (when-not head (throw (java.io.IOException. "no answer")))
-              n      (or (:content-length (parse-head (str "X / HTTP/1.1\r\n"
-                                                           (second (str/split (head-text head) #"\r\n" 2)))))
-                         0)
-              body   (.readNBytes in (int n))
+              ; parse-head wants a request line first; the status line is
+              ; replaced by a dummy one.
+              framing (parse-head (str "X / HTTP/1.1\r\n"
+                                       (second (str/split (head-text head) #"\r\n" 2))))
+              body   (:data (read-body in framing))
               r      {:sent sent :answered (now-ms)
                       :status (status-of head (alength head))
                       :body (String. body StandardCharsets/UTF_8)}]

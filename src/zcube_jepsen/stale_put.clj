@@ -16,9 +16,10 @@
     :await-registered, then
       --release-after running:    :apply :await-running :release
       --release-after registered: :release :apply
-    with :start-agent(n5) just before the release (--spare-at before) or
-    just after it, then :observe :collect. --services 0 applies nothing: the
-    idle node of #237's liveness note.
+    with :start-agent(n5) :await-ready(n5) just before the release
+    (--spare-at before) or just after it, then :observe :collect. --services
+    0 applies nothing: the idle node of #237's liveness note. A wait that
+    fails (:timed-out, :deadline) or a step that throws makes the run vacuous.
 
   What is checked, from the store's log (zcube.store_log, read at the end):
     stale-registrations  I2: a put of /nodes/<node> on a lower lease than an
@@ -34,22 +35,29 @@
                          (docs/authority.md).
   and from the nodes' own process records (resources/proc-watch.sh):
     overlap              per service, how long two different replicas (or one
-                         replica on two nodes) ran at once, against the I1b
-                         window of 1.9 s. Slice 2 builds the general overlap
-                         checker; this is the smallest one this slice needs.
-  and from the proxy's log:
-    orphan-keepalives    renewals of the agent's lease, answered 200, after
-                         /nodes/n4 had stopped naming it.
+                         replica on two nodes) may have run at once, against
+                         the I1b window of 1.9 s. Each run of samples is
+                         widened to the samples around it. Slice 2 builds the
+                         general overlap checker; this is the smallest one
+                         this slice needs.
+  and from the proxy's log against the store:
+    orphan-keepalives    renewals of a lease of n4's, answered 200 after the
+                         release, while /nodes/n4 (replayed from the store, at
+                         the time of the answer) named another lease or none.
   Liveness is reported, not judged: n4's final registration and status.
 
   --expect decides what passes:
-    bug    the release must be answered 200 and a stale registration must be
-           in the store (the expected failure while #237 is open).
-    valid  everything must hold, and the release must have been refused while
-           L1 was still live (a fixed server).
-    auto   bug if the release was answered 200, valid if it was refused with
-           anything but ZC-E0205 (lease ended), else the run is vacuous and
-           invalid."
+    bug    the release must be answered 200, and the stale registration in
+           the store must be the release's own put (its revision, on L1): the
+           expected failure while #237 is open.
+    valid  the release must have been refused while L1 was still live, by a
+           4xx that is not ZC-E0205 (lease ended) and either names a code in
+           `refusal-codes` or left /nodes/n4 on L2; the run must be complete
+           (collect worked, the store log starts at revision 1 uncompacted,
+           L2's registration is in it, every agent node has process samples)
+           and every check must hold (a fixed server).
+    auto   bug if the release was answered 200, valid if it was refused as
+           above, else the run is vacuous and invalid."
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.pprint :refer [pprint]]
@@ -66,6 +74,7 @@
                     [tests :as tests]
                     [util :as util]]
             [jepsen.control.util :as cu]
+            [jepsen.control.net :as cn]
             [zcube-jepsen [api :as api]
                           [hold-proxy :as hp]
                           [postgres :as pg]
@@ -134,6 +143,14 @@
       :--cpu-millis 4000
       :--memory-bytes 8589934592
       :--images (str zcube/dir "/images.zon"))))
+
+(defn agent-log-tail
+  "The last lines of the agent's log on `node`, for a diagnosis."
+  [test node]
+  (try (-> (c/on-nodes test [node]
+                       (fn [_ _] (c/su (c/exec :tail :-n 30 zcube/agent-log))))
+           (get node))
+       (catch Exception e (.getMessage e))))
 
 (defn kill-agent!
   "SIGKILL to the agent alone: its containers' supervisors are in their own
@@ -222,7 +239,10 @@
   [test st op]
   (let [{:keys [proxy http]} @st
         n4 (held-node test) n5 (spare-node test)
-        deadline (fn [] (+ (:l1-granted @st) (:lease-ttl-ms test) -1500))]
+        deadline (fn []
+                   (if-let [g (:l1-granted @st)]
+                     (+ g (:lease-ttl-ms test) -1500)
+                     (throw (ex-info "L1's grant time is unknown" {}))))]
     (case (:f op)
       :arm (do (hp/arm! proxy) :armed)
 
@@ -230,21 +250,53 @@
       (let [node (:value op)]
         (c/on-nodes test [node]
                     (fn [_ _]
+                      ; An address, not the name: the agent's --server takes
+                      ; host:port as an IP (zcube/start-agent! does the same).
                       (if (= node n4)
                         (start-agent! node (str (:control-ip @st) ":" (:proxy-port test)))
-                        (start-agent! node (str (zcube/server-node test) ":" zcube/port)))))
+                        (start-agent! node (str (cn/ip (zcube/server-node test))
+                                                ":" zcube/port)))))
         node)
 
       :await-held
       (let [h (poll! (+ (hp/now-ms) 20000) #(hp/held proxy))
-            grant (->> (hp/requests proxy)
-                       (filter #(and (= "POST" (:method %))
-                                     (re-matches #"/v1/agent/nodes/[^/]+/lease" (:path %))))
-                       first)
+            ; The proxy logs a relayed request when its answer ends, which
+            ; can be after the agent already sent the PUT the proxy holds:
+            ; wait for the grant's entry too.
+            grant (poll! (+ (hp/now-ms) 5000)
+                         (fn []
+                           (->> (hp/requests proxy)
+                                (filter #(and (= "POST" (:method %)) (= 200 (:status %))
+                                              (re-matches #"/v1/agent/nodes/[^/?]+/lease(?:\?.*)?"
+                                                          (:path %))))
+                                first)))
             lease (some-> h :body (json/parse-string true) :lease)]
         (when-not h (throw (ex-info "no registration was held" {})))
-        (swap! st assoc :l1 lease :l1-granted (:end grant))
-        {:lease lease :held-at (:at h) :granted-at (:end grant) :body (:body h)})
+        (when-not grant (throw (ex-info "no lease grant was logged" {})))
+        ; L1 can have been granted no earlier than the grant request arrived,
+        ; so it lives at least until that + ttl: the deadline errs early.
+        (swap! st assoc :l1 lease :l1-granted (:at grant))
+        {:lease lease :held-at (:at h) :granted-at (:at grant)
+         :grant-answered (:end grant) :body (:body h)})
+
+      :await-ready
+      (let [node (:value op)
+            ; Before the release the spare must be ready while L1 still runs;
+            ; after it, there is no such bound.
+            until (if (= :before (:spare-at test))
+                    (deadline)
+                    (+ (hp/now-ms) 20000))
+            r (poll! until
+                     (fn []
+                       (let [kv (first (list-prefix http test (str "/nodes/" node)))
+                             ns (first (list-prefix http test (str "/node-status/" node)))]
+                         (when (and kv (= "ready" (-> ns :value :state)))
+                           {:lease (:lease kv) :tenure (:mod_revision kv)
+                            :at (hp/now-ms)}))))]
+        (or r
+            (do (warn "agent on" node "never registered; its log:\n"
+                      (agent-log-tail test node))
+                :timed-out)))
 
       :kill-agent (do (c/on-nodes test [(:value op)] (fn [_ _] (kill-agent!)))
                       (:value op))
@@ -258,7 +310,7 @@
                                     (= "ready" (-> ns :value :state)))
                            {:lease (:lease kv) :tenure (:mod_revision kv)
                             :at (hp/now-ms)}))))]
-        (swap! st assoc :l2 (:lease r))
+        (swap! st assoc :l2 (:lease r) :l2-tenure (:tenure r))
         (or r :timed-out))
 
       :apply
@@ -278,10 +330,19 @@
           (or r :deadline)))
 
       :release
-      (let [r (hp/release! proxy)]
-        (assoc r :l1-deadline (+ (:l1-granted @st) (:lease-ttl-ms test))
-               :code (some-> (:body r) (json/parse-string true)
-                             :diagnostics first :code)))
+      (let [l1-deadline (+ (or (:l1-granted @st)
+                               (throw (ex-info "L1's grant time is unknown" {})))
+                           (:lease-ttl-ms test))
+            r    (hp/release! proxy)
+            body (try (json/parse-string (:body r) true) (catch Exception _ nil))
+            ; What /nodes/n4 names right after the answer: a refusal must
+            ; have left it on L2.
+            kv   (try (first (list-prefix http test (str "/nodes/" n4)))
+                      (catch Exception _ nil))]
+        (assoc r :l1-deadline l1-deadline
+               :code (when (map? body) (-> body :diagnostics first :code))
+               :revision (when (map? body) (:revision body))
+               :n4-after (when kv {:lease (:lease kv) :tenure (:mod_revision kv)})))
 
       :observe (do (Thread/sleep (* 1000 (:observe-s test))) (:observe-s test))
 
@@ -383,30 +444,41 @@
          [(parse-long t) (set ids)])))
 
 (defn intervals
-  "{[node id] [[start end] ...]} from each node's samples: a replica's
-  presence in consecutive samples (gap < 1 s) is one interval."
+  "{[node id] [[start end] ...]} from each node's samples. A run of
+  consecutive samples naming a replica is one interval, widened to the node's
+  samples on either side of the run: the replica may have started just after
+  the sample before and stopped just before the sample after. A gap between
+  samples (the watcher stalled) is unknown, not absent: it never splits a
+  run, and a run next to it is widened across it."
   [procs]
   (into {}
         (for [[node lines] procs
-              :let [samples (parse-procs lines)]
+              :let [samples (vec (sort-by first (parse-procs lines)))
+                    n (count samples)
+                    t (fn [i] (first (samples i)))]
               id (distinct (mapcat second samples))]
           [[node id]
-           (->> samples
-                (filter #(contains? (second %) id))
-                (map first)
-                (reduce (fn [acc t]
-                          (let [[s e] (peek acc)]
-                            (if (and e (< (- t e) 1000))
-                              (conj (pop acc) [s t])
-                              (conj acc [t t]))))
-                        []))])))
+           (loop [i 0 out [] start nil]
+             (if (= i n)
+               (if start (conj out [start (t (dec n))]) out)
+               (let [in? (contains? (second (samples i)) id)]
+                 (cond
+                   (and in? (nil? start)) (recur (inc i) out (t (max 0 (dec i))))
+                   (and (not in?) start)  (recur (inc i) (conj out [start (t i)]) nil)
+                   :else                  (recur (inc i) out start)))))])))
+
+(defn service-of-id
+  "A replica id's service: <service>-<n>."
+  [id]
+  (second (re-matches #"(.+)-\d+" id)))
 
 (defn overlap
   "Per service, the longest time two different [node replica] ran at once.
-  `service-of` maps a replica id to its service."
+  `service-of` maps a replica id to its service; an id it does not know is
+  mapped by its name (<service>-<n>)."
   [procs service-of]
   (let [iv (intervals procs)
-        by-svc (group-by (fn [[[_ id] _]] (service-of id)) iv)
+        by-svc (group-by (fn [[[_ id] _]] (or (service-of id) (service-of-id id))) iv)
         per (into {}
                   (for [[svc xs] by-svc :when svc]
                     [svc (reduce max 0
@@ -424,84 +496,194 @@
                  :when (and (str/starts-with? (:key r) "/assigned/") (not (:deleted r)))]
              [(id-of (:key r)) (-> r :value :service)])))
 
+(defn missing-procs
+  "The nodes whose process records hold no sample although they must: every
+  agent node, and every node a replica was assigned to."
+  [procs rows agent-nodes]
+  (let [assigned (keep #(when (str/starts-with? (:key %) "/assigned/") (node-of (:key %)))
+                       rows)]
+    (vec (sort (for [n (distinct (concat agent-nodes assigned))
+                     :when (empty? (parse-procs (get procs n)))]
+                 n)))))
+
+(defn registration-times
+  "[[t lease-or-nil] ...] for `node`: when /nodes/<node> came to name each
+  lease (nil: deleted), in revision order. A put's time is the at_ms of the
+  /node-status/<node> the server wrote for that tenure; failing that, the
+  answer of the matching registration PUT in the proxy log (the k-th put
+  answered 200 is the k-th put in the store). A delete takes the time of the
+  next node-status row after it."
+  [rows proxy-log node]
+  (let [nk (str "/nodes/" node) sk (str "/node-status/" node)
+        status (filter #(and (= sk (:key %)) (not (:deleted %))) rows)
+        at-tenure (into {} (for [r (reverse status)
+                                 :let [ten (-> r :value :tenure)]
+                                 :when ten]
+                             [ten (-> r :value :at_ms)]))
+        puts (filter #(and (= nk (:key %)) (not (:deleted %))) rows)
+        ok-puts (->> proxy-log
+                     (filter #(and (= "PUT" (:method %)) (= 200 (:status %))
+                                   (= (str "/v1/agent/nodes/" node)
+                                      (first (str/split (str (:path %)) #"\?")))))
+                     (sort-by :end)
+                     (mapv :end))
+        put-idx (into {} (map-indexed (fn [i r] [(:rev r) i]) puts))]
+    (vec (for [r rows
+               :when (= nk (:key r))
+               :let [t (if (:deleted r)
+                         (some #(when (> (:rev %) (:rev r)) (-> % :value :at_ms)) status)
+                         (or (at-tenure (:rev r))
+                             (get ok-puts (put-idx (:rev r)))))]
+               :when t]
+           [t (when-not (:deleted r) (:lease r))]))))
+
 (defn orphan-keepalives
-  "Keepalives answered 200 after the release on a lease other than the one
-  the stale registration put back."
-  [proxy-log release l1]
-  (vec (for [r proxy-log
-             :let [[_ lease] (re-matches #"/v1/agent/nodes/[^/]+/lease/(\d+)/keepalive(?:\?.*)?" (str (:path r)))]
-             :when (and lease (= 200 (:status r)) (> (:at r) (:answered release))
-                        (not= l1 (parse-long lease)))]
-         (select-keys r [:at :path]))))
+  "Keepalives of `node`'s leases answered 200 after the release while
+  /nodes/<node>, as replayed from the store at the time of the answer, named
+  another lease (or none): renewals the server granted although the lease no
+  longer held the node."
+  [proxy-log rows release node]
+  (let [times (sort-by first (registration-times rows proxy-log node))
+        named (fn [t] (some-> (last (take-while #(<= (first %) t) times)) second))]
+    (vec (for [r proxy-log
+               :let [[_ lease] (re-matches #"/v1/agent/nodes/[^/]+/lease/(\d+)/keepalive(?:\?.*)?"
+                                           (str (:path r)))
+                     lease (some-> lease parse-long)]
+               :when (and lease (= 200 (:status r)) (:end r)
+                          (> (:end r) (:answered release))
+                          (not= lease (named (:end r))))]
+           (assoc (select-keys r [:at :end :path]) :named (named (:end r)))))))
+
+(def refusal-codes
+  "Codes a fixed server may refuse the stale registration with: a failed
+  compare (ZC-E0105) or the tenure compare's refusal (ZC-E0510). Any other
+  code counts only if /nodes/n4 was still on L2 right after the answer."
+  #{"ZC-E0105" "ZC-E0510"})
+
+(defn release-revision
+  "The revision the release's answer names (older histories have it only in
+  the body)."
+  [rel]
+  (or (:revision rel)
+      (try (:revision (json/parse-string (:body rel) true)) (catch Exception _ nil))))
+
+(def failed-wait? #{:timed-out :deadline})
+
+(defn failed-step?
+  "A step value that means the schedule did not happen as planned."
+  [v]
+  (or (failed-wait? v) (and (vector? v) (= :error (first v)))))
 
 (defn analyse
   "Everything the checker judges, from the history's step values."
-  [history n4]
-  (let [v (fn [f] (->> history (filter #(and (= :info (:type %)) (= f (:f %))
-                                             (some? (:value %))))
-                       (map :value) last))
+  [history n4 agent-nodes]
+  (let [infos (filter #(and (= :info (:type %)) (= :nemesis (:process % :nemesis))
+                            (some? (:value %)))
+                      history)
+        ; Each step's completion comes after its invocation, whose value is
+        ; nil or the step's node.
+        v (fn [f] (->> infos (filter #(= f (:f %))) (map :value) last))
         held (v :await-held)
         rel  (v :release)
         col  (v :collect)
-        rows (-> col :store :rows)
+        col-ok (map? col)
+        rows (if col-ok (-> col :store :rows) [])
         {:keys [superseded-observed i1a final]} (replay rows)
         stale (stale-registrations rows)
-        ov   (overlap (:procs col) (service-map rows))
-        status (some-> (final (str "/node-status/" n4)) :value)]
+        ov   (overlap (when col-ok (:procs col)) (service-map rows))
+        status (some-> (get final (str "/node-status/" n4)) :value)
+        reg (v :await-registered)]
     {:held held
-     :registered (v :await-registered)
+     :registered reg
      :running (v :await-running)
+     :spare-ready (v :await-ready)
+     :failed-steps (vec (for [o infos :when (failed-step? (:value o))]
+                          [(:f o) (:value o)]))
+     :collected col-ok
      :release rel
-     :compacted (-> col :store :compacted)
+     :compacted (when col-ok (-> col :store :compacted))
      :first-rev (:rev (first rows))
+     :l2-registered (boolean (and (map? reg)
+                                  (some #(and (= (str "/nodes/" n4) (:key %)) (not (:deleted %))
+                                              (= (:lease reg) (:lease %)) (= (:tenure reg) (:rev %)))
+                                        rows)))
+     :procs-missing (if col-ok (missing-procs (:procs col) rows agent-nodes) (vec agent-nodes))
      :stale-registrations stale
      :superseded-observed superseded-observed
      :i1a i1a
      :overlap (dissoc ov :intervals)
      :intervals (:intervals ov)
-     :orphan-keepalives (count (when (and (seq stale) (map? rel))
-                                 (orphan-keepalives (:proxy col) rel (:lease held))))
-     :n4-final {:registered (some? (final (str "/nodes/" n4)))
+     :orphan-keepalives (count (when (and (seq stale) (map? rel) col-ok)
+                                 (orphan-keepalives (:proxy col) rows rel n4)))
+     :n4-final {:registered (some? (get final (str "/nodes/" n4)))
                 :lease (:lease (first (filter #(= (str "/nodes/" n4) (:key %))
                                               (reverse rows))))
                 :status (:state status)
                 :status-at (:at_ms status)
-                :lost-for-ms (when (and (:at_ms status) (not= "ready" (:state status)))
+                :lost-for-ms (when (and col-ok (:at_ms status) (not= "ready" (:state status)))
                                (- (:end col) (:at_ms status)))}
      :rows rows
-     :proxy (:proxy col)}))
+     :proxy (when col-ok (:proxy col))}))
 
 (defn judge
   "{:valid? :outcome ...} from analyse's map and the expectation."
   [a expect]
   (let [rel     (:release a)
+        reg     (:registered a)
         landed  (and (map? rel) (= 200 (:status rel)))
-        refused (and (map? rel) (integer? (:status rel)) (<= 400 (:status rel) 499)
-                     (not= "ZC-E0205" (:code rel))
-                     (< (:answered rel) (:l1-deadline rel)))
-        bug?    (and landed (seq (:stale-registrations a)))
-        clean?  (and (empty? (:stale-registrations a))
+        ; Refused while L1 still ran, by a 4xx that says why, or that at least
+        ; left /nodes/n4 where L2's registration put it.
+        refused (boolean
+                  (and (map? rel) (integer? (:status rel)) (<= 400 (:status rel) 499)
+                       (integer? (:answered rel)) (integer? (:l1-deadline rel))
+                       (< (:answered rel) (:l1-deadline rel))
+                       (not= "ZC-E0205" (:code rel))
+                       (or (contains? refusal-codes (:code rel))
+                           (and (map? reg) (map? (:n4-after rel))
+                                (= (:lease reg) (:lease (:n4-after rel)))
+                                (= (:tenure reg) (:tenure (:n4-after rel)))))))
+        ; The stale row is the one the release itself committed.
+        bug?    (boolean
+                  (and landed
+                       (some #(and (= (release-revision rel) (:rev %))
+                                   (= (-> a :held :lease) (:lease %)))
+                             (:stale-registrations a))))
+        ; What a :fixed verdict stands on: a whole store history from rev 1,
+        ; L2's registration in it, process records from every node that needs
+        ; them.
+        complete? (and (:collected a)
+                       (= 1 (:first-rev a))
+                       (= 0 (:compacted a))
+                       (:l2-registered a)
+                       (empty? (:procs-missing a)))
+        clean?  (and complete?
+                     (empty? (:stale-registrations a))
                      (empty? (:superseded-observed a))
                      (empty? (:i1a a))
                      (<= (-> a :overlap :max-ms) window-ms))
-        expect  (if (= :auto expect)
-                  (cond landed :bug refused :valid :else :vacuous)
-                  expect)
+        failed  (seq (:failed-steps a))
+        expect  (cond failed :vacuous
+                      (= :auto expect) (cond landed :bug refused :valid :else :vacuous)
+                      :else expect)
         outcome (case expect
                   :bug     (if bug? :expected-failure-237 (if landed :landed-without-stale :not-landed))
-                  :valid   (if (and refused clean?) :fixed (if refused :refused-but-unsafe :not-refused))
+                  :valid   (cond (and refused clean?) :fixed
+                                 (and refused (not complete?)) :refused-but-incomplete
+                                 refused :refused-but-unsafe
+                                 :else :not-refused)
                   :vacuous :vacuous)]
     {:valid?  (boolean (case expect :bug bug? :valid (and refused clean?) :vacuous false))
      :expect  expect
      :outcome outcome
      :release-landed landed
      :release-refused refused
+     :complete complete?
      :window-ms window-ms}))
 
 (defn checker [expect]
   (reify checker/Checker
     (check [_ test history opts]
-      (let [a (analyse history (held-node test))
+      (let [a (analyse history (held-node test) (zcube/agent-nodes test))
             j (judge a expect)
             summary (merge j (dissoc a :rows :proxy :intervals))]
         ; The reproducing history: every step, the store rows, the proxy's
@@ -525,8 +707,8 @@
   [test]
   (let [n4 (held-node test) n5 (spare-node test)
         release (if (= :before (:spare-at test))
-                  [[:start-agent n5] [:release]]
-                  [[:release] [:start-agent n5]])]
+                  [[:start-agent n5] [:await-ready n5] [:release]]
+                  [[:release] [:start-agent n5] [:await-ready n5]])]
     (->> (concat [[:arm] [:start-agent n4] [:await-held] [:kill-agent n4]
                   [:start-agent n4] [:await-registered]]
                  (if (= :registered (:release-after test))
