@@ -6,14 +6,16 @@ for linearizability of the store, the authority invariants and the job
 invariants. It lives out of the Zigcube tree by decision (Clojure and
 Leiningen are allowed here, not there).
 
-**Status: slice 1 done.** Five nodes, the fault primitives, and a register
-test through `zcube-server`'s API under partitions and Postgres failover run
-and pass in CI. What the test does not yet do is listed under
+**Status: slices 1 and 2 done.** Five nodes, the fault primitives, a
+register test through `zcube-server`'s API under partitions and Postgres
+failover, and a lease test (I1a, the I1b overlap measured on the agents, the
+fencing inequality) with a wedged-agent negative control. What the test does not yet do is listed under
 [What is not covered yet](#what-is-not-covered-yet).
 
 ## What runs
 
-Two tests on the same cluster and the same fault schedule.
+Two register tests on the same cluster and the same fault schedule, and the
+lease test ([below](#the-lease-test-slice-2)).
 
 | Part       | What it is |
 |------------|------------|
@@ -63,7 +65,82 @@ Both use 10 workers, 2 per key, 60 ops per key.
 | unfenced-async | `--replication async --failover unfenced --expect lost-write` | As the negative control: the old primary keeps acknowledging writes that the rejoin wipes, and the checkers must catch it. |
 | negative control | `--replication async --failover lagged --expect lost-write` | Not vacuous, the store read worked, Knossos or Elle caught it (`:caught-by`), and Elle's store-based facts show the loss itself (`:lost-evidence`). A `ZC-E0215` halt is reported as `:halted?` but does not count. The standby is asynchronous and cut off for `--lag-ms` (4000) before a fenced promotion, so acknowledged writes are lost. |
 
+### The lease test (slice 2)
+
+**`--workload lease`** (`zcube-lease-<expect>`): `n3` runs `zcube-server`
+(`--lease-ttl-ms` 10000, `--lost-grace-ms` 1000), `n4`/`n5` run
+`zcube-agent` with the fake runtime.
+
+- **Load.** `--services` (6) services `l<k>x` of one replica each, applied
+  once. Every replica's command is a recorder (`/opt/zcube/zj-rec.sh`, in
+  `lease.clj`) that writes, on the shared host clock (`$EPOCHREALTIME`), its
+  start, a heartbeat every 50 ms, and each TERM it gets, which it ignores, so
+  the agent's KILL is what ends it (the fence's worst case). The fake
+  runtime's own state has no stop times, hence the recorder. Reads of
+  `/assigned/` every 2 s.
+- **Watch.** From revision 1, a long poll of `/v1/watch` on `/assigned/` and
+  `/replicas/` for the whole run; a 410 is recorded as a gap.
+- **Faults** (`--fault-ms`, 25000, over twice the lease). Valid mode, a loop
+  of: 15 s quiet, one agent cut off from the server, heal, 15 s quiet, the
+  server cut off from both Postgres nodes, heal. Wedged mode
+  (`--expect overlap`): 15 s quiet, every `zcube-agent` process (agent and
+  supervisors) of one agent node SIGSTOPped, SIGCONT. Then heal, 30 s
+  settle, a read, and `:collect` (the rest of the watch, every node's
+  records).
+- **Checkers** (`lease_checkers.clj`, pure, unit tested):
+  - **fencing**: `fence_margin >= fence_stop + ceil(ttl x skew) + kill
+    latency` and `ttl - margin >= fence_window_min`, with the constants read
+    from the `src/constants.zig` of the Zigcube that ran
+    (`--zcube-constants`) and the ttl the server ran with. At the defaults:
+    3000 >= 2000 + 100 + 900, slack 0.
+  - **I1a**: the watch replayed revision by revision; at every revision each
+    replica id has at most one `/assigned/<node>/<id>`. A gap makes it
+    `:unknown`, which fails.
+  - **I1b**: per service (one replica, so any two instances of it are an old
+    instance and its replacement), each instance's overlap with every earlier
+    one, from the records: `min(ends) - max(starts)`, where an end is the
+    last heartbeat or TERM. Bound: `lost_grace_ms + fence_kill_latency_ms` =
+    1900 ms. The measured maximum is reported; it is a lower bound, at most
+    one heartbeat (50 ms) short.
+  - **sanity**: every apply `:ok`, the collect happened, at least
+    `--min-handovers` (1) handovers across nodes.
+- **Verdict.** `valid`: all four hold. `overlap` (the negative control):
+  sanity, fencing and I1a hold and I1b fails.
+
+The lease jobs build Zigcube at `fb385b2` (main, 2026-11-13), not `f7736a7`:
+see the finding below.
+
+### Findings
+
+- **At `f7736a7`, a fencing agent cut off from the server kills about 8 s
+  late, and I1b fails by 5.4 s.** Between fence steps the agent's loop
+  waits with a server watch (`agent_run.zig` `watch`), and while a fence is
+  active `Agent.fence_at_ms()` is null, so `calls_deadline_ms` is maxInt
+  and the call is capped only by `agent_io_timeout_ms` (10 s). The TERM
+  step runs on time; the KILL step runs ~10 s after it instead of 2 s.
+  Measured (local run, agent `n4` cut off from the server at 00:19:25.5):
+  TERM at 00:19:32.120, replacements on `n5` from 00:19:36.926, the old
+  instances' last heartbeats at 00:19:42.32: overlaps 5395, 5386, 5371 ms
+  against a 1900 ms bound. The same happened in the store partition (TERM
+  to last heartbeat 10.16 s on `n5`), with no overlap only because the
+  replacements came 10 s later. `fb385b2` (#225, "fence waits are pauses,
+  not watches") removes the call: the same run there gives a 2.9 s gap
+  before every replacement. #225 was filed for a busy loop after a restart;
+  this is a second effect of the same wait, and the TLA model's FINDINGS
+  item 4 (no term for a late KILL step) is the gap in the model that let it
+  through. Reported to the supervisor, not filed.
+
 ### Last result
+
+Slice 2 (branch `claude/jepsen-2`), local runs at `fb385b2`:
+
+| run | faults | handovers (cross-node) | max overlap | I1a | verdict |
+|---|---|---|---|---|---|
+| valid, 90 s | 1 agent cut off, 1 store cut off | 9 (6) | -2912 ms (a gap; upper bound -2862) | 39 revisions, ok | valid |
+| wedged, 120 s, `--expect overlap` | 3 wedges of 30 s | 9 (9) | 20564 ms (bound 1900) | 39 revisions, ok | valid (I1b caught) |
+
+At `f7736a7` the valid run fails I1b, max overlap 5395 ms (finding above).
+CI: see the PR.
 
 Slice 1b (branch `claude/jepsen-1b`), local runs of the `pg` workload, 60 s
 each: fenced valid (write outage 4.3 to 4.7 s per failover), unfenced valid
@@ -117,19 +194,21 @@ Results land in `store/<test name>/<time>/`: `results.edn`, `history.edn`,
 (`n1/`, `n2/` Postgres; `n3/server.log`; `n4/`, `n5/` `agent.log`).
 `lein run serve` browses them.
 
-Options: `--workload api|pg`, `--zcube-bin DIR` (default
+Options: `--workload api|pg|lease`, `--zcube-bin DIR` (default
 `zigcube/zig-out/bin`), `--zcube-images FILE` (default
 `zigcube/fixtures/images.zon`), `--lease-ttl-ms N`, `--time-limit S`,
 `--concurrency N` (a multiple of 2), `--ops-per-key N`, `--min-failovers N`,
 `--failover fenced|unfenced|lagged`, `--replication sync|async`,
 `--expect valid|lost-write`, `--repoint-delay-ms N`, `--lag-ms N`,
-`--[no-]client-partition`. `lein test` runs the checkers' unit tests. Elle
+`--[no-]client-partition`; for lease: `--expect valid|overlap`,
+`--services N`, `--fault-ms N`, `--lost-grace-ms N`, `--min-handovers N`,
+`--zcube-constants FILE` (default `zigcube/src/constants.zig`). `lein test` runs the checkers' unit tests. Elle
 draws the cycles it finds with graphviz (`dot`); without it, it checks
 without drawings.
 
-CI: `.github/workflows/jepsen.yml` runs each workload in each mode (six jobs)
-on `ubuntu-24.04` for every pull request and every push to `main`,
-`claude/harness` and `claude/jepsen-1b`, and uploads `store/` as artifacts
+CI: `.github/workflows/jepsen.yml` runs each register workload in each mode
+(eight jobs) and the lease test in two modes on `ubuntu-24.04` for every
+pull request and every push to `main` and the `claude/` branches, and uploads `store/` as artifacts
 `jepsen-store-<workload>-<mode>`.
 
 ## Fault primitives in containers
@@ -161,7 +240,16 @@ clock-offset test hook in the binaries, or KVM guests with their own clocks.
   update between two writers, only stale or impossible reads.
 - **Only the apply and list paths of the server are exercised.** Agents run
   and are told to start containers, but nothing checks what they did.
-- **No clock faults and no SIGSTOP in the test**, only the probe.
+- **No clock faults in the test**, only the probe. SIGSTOP is used only
+  for the lease negative control.
+- **The lease test's limits.** I1a is checked from the server's watch, not
+  cross-checked against the store log. One replica per service, so the
+  old/new pairing is by service, not from the server's decisions. No agent
+  restart and no connection broken with a registration in flight, so the
+  model's FINDINGS 1 (a stale registration PUT) and 2 (no grace for a second
+  expiry) are not reached. `fence_margin_ms` cannot be lowered without
+  changing Zigcube, so there is no negative control for the inequality
+  itself (`docs/plan.md`, slice 2).
 - **The api workload has run only in CI.** The session that wrote it could
   not build Zigcube locally (its Zigbox dependency could not be fetched
   there).
@@ -180,6 +268,8 @@ src/zcube_jepsen/api.clj        register client over zcube-server's HTTP API
 src/zcube_jepsen/register.clj   CAS register client over JDBC (pg workload)
 src/zcube_jepsen/nemesis.clj    partitions that include the control host
 src/zcube_jepsen/checkers.clj   Elle versioned register, outage, sanity, verdict
+src/zcube_jepsen/lease.clj      lease workload: recorder, watch, faults, collect
+src/zcube_jepsen/lease_checkers.clj  fencing, I1a, I1b, lease verdict
 test/                           checker unit tests
 docker/                         node image, up/down, fault probe
 docs/plan.md                    slices: what is done and what is next
