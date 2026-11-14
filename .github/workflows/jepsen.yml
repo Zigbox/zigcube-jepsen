@@ -65,6 +65,12 @@ jobs:
             mode: wedged
             mode_args: --time-limit 120 --expect overlap --fault-ms 30000
             zigcube: fb385b2d0d7e6beefd3225e71ae2bcf3437aa474
+          # late-kill: the valid schedule at f7736a7, whose late KILL must
+          # break I1b: a negative control of the protocol itself.
+          - workload: lease
+            mode: late-kill
+            mode_args: --time-limit 120 --expect overlap --lease-faults partition
+            zigcube: f7736a72f85c8ea21c1359c69a19539e00f0a5b9
     env:
       LEIN_VERSION: "2.11.2"
       # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.

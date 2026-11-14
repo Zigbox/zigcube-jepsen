@@ -205,13 +205,19 @@ test". What changed from the plan above:
   and the server refuses a ttl the margin cannot cover (ZC-E0121). The
   smallest test-only switch, **proposed, not added** (Zigcube is read-only
   from here): a teeth agent root `src/zcube_agent_fence_teeth.zig`, after
-  the `zcube_agent_teeth.zig` precedent, declaring
-  `c1_teeth_fence_margin_ms` (say 1000) that `fencing.zig` reads in place of
-  `fence_margin_ms` on the agent only, built as a separate
-  `zcube-agent-fence-teeth`. The server keeps the real margin and accepts
-  ttl 10000; the agent fences 2 s later than the server assumes, its KILL
-  lands after the lost grace, and I1b must fail by about 1.1 s with no
-  wedge. Until then the negative control is a SIGSTOPped agent node, which
+  the `zcube_agent_teeth.zig` precedent, built as a separate
+  `zcube-agent-fence-teeth` whose agent breaks the inequality while the
+  server, checking the real constants, accepts ttl 10000. Lowering the
+  agent's margin alone (`c1_teeth_fence_margin_ms`) is **not enough**: the
+  KILL moves later by at most the margin (3 s), to about 200 - m ms past the
+  replacement's start, inside I1b's 1900 ms bound (which includes the lost
+  grace), so no checker here could tell. The switch that bites is the stop
+  term: `c1_teeth_fence_stop_ms` (say 8000) read by `fencing.kill_at_ms` on
+  the agent only. The KILL then lands ~7 s after the lease's end, and I1b
+  fails by ~5 s with no wedge, which is what `f7736a7`'s late KILL did by
+  accident (below), so CI also runs the valid schedule at `f7736a7` as a
+  second negative control (`lease / late-kill`, `--expect overlap --lease-faults partition`).
+  Meanwhile the first negative control is a SIGSTOPped agent node, which
   must and does break I1b (20.6 s).
 - Finding: at `f7736a7` a fence's KILL comes ~8 s late on an agent cut off
   from the server (README "Findings"); the lease jobs pin `fb385b2`, which

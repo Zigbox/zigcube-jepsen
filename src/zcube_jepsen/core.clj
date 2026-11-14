@@ -177,12 +177,15 @@
   "valid: an agent cut off from the server, then the server cut off from
   Postgres, each for longer than the lease (the ttl plus the lost grace and
   then some, so that the node is lost and its replicas are replaced).
-  overlap (the negative control): an agent stopped with SIGSTOP as long."
+  wedge (the negative control): an agent stopped with SIGSTOP as long.
+  --lease-faults picks one; by default wedge with --expect overlap, else
+  partition."
   [opts]
   (let [hold (gen/sleep (/ (:fault-ms opts) 1000))
         gap  (gen/sleep 15)]
-    (case (:expect opts)
-      :overlap (cycle [gap {:type :info :f :wedge} hold
+    (case (or (:lease-faults opts)
+              (if (= :overlap (:expect opts)) :wedge :partition))
+      :wedge (cycle [gap {:type :info :f :wedge} hold
                        {:type :info :f :unwedge}])
       (cycle [gap {:type :info :f :isolate-agent} hold {:type :info :f :heal}
               gap {:type :info :f :isolate-store} hold {:type :info :f :heal}]))))
@@ -230,7 +233,8 @@
   (let [n (:services opts)]
     (merge tests/noop-test
            opts
-           {:name      (str "zcube-lease-" (name (:expect opts)))
+           {:name      (str "zcube-lease-" (name (:expect opts))
+                             (some->> (:lease-faults opts) name (str "-")))
             :os        os/noop
             :db        (lease/db)
             :client    (lease/client)
@@ -277,6 +281,10 @@
     :default 6 :parse-fn parse-long]
    [nil "--fault-ms N" "lease: how long each fault holds (longer than the ttl)."
     :default 25000 :parse-fn parse-long]
+   [nil "--lease-faults KIND"
+    "lease: partition (an agent from the server, the server from Postgres) or wedge (SIGSTOP an agent node). Default: wedge with --expect overlap, else partition."
+    :parse-fn keyword
+    :validate [#{:partition :wedge} "must be partition or wedge"]]
    [nil "--min-handovers N"
     "lease: fail the run if fewer replicas were replaced onto another node."
     :default 1 :parse-fn parse-long]

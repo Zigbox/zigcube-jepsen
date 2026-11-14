@@ -201,13 +201,14 @@ Options: `--workload api|pg|lease`, `--zcube-bin DIR` (default
 `--failover fenced|unfenced|lagged`, `--replication sync|async`,
 `--expect valid|lost-write`, `--repoint-delay-ms N`, `--lag-ms N`,
 `--[no-]client-partition`; for lease: `--expect valid|overlap`,
-`--services N`, `--fault-ms N`, `--lost-grace-ms N`, `--min-handovers N`,
+`--lease-faults partition|wedge`, `--services N`, `--fault-ms N`, `--lost-grace-ms N`, `--min-handovers N`,
 `--zcube-constants FILE` (default `zigcube/src/constants.zig`). `lein test` runs the checkers' unit tests. Elle
 draws the cycles it finds with graphviz (`dot`); without it, it checks
 without drawings.
 
 CI: `.github/workflows/jepsen.yml` runs each register workload in each mode
-(eight jobs) and the lease test in two modes on `ubuntu-24.04` for every
+(eight jobs) and the lease test in three modes (valid and wedged at `fb385b2`, late-kill:
+the valid schedule at `f7736a7`, expected to break I1b) on `ubuntu-24.04` for every
 pull request and every push to `main` and the `claude/` branches, and uploads `store/` as artifacts
 `jepsen-store-<workload>-<mode>`.
 
