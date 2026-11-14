@@ -2,7 +2,7 @@ name: jepsen
 
 on:
   push:
-    branches: [main, claude/harness, claude/jepsen-1b]
+    branches: [main, claude/harness, claude/jepsen-1b, claude/jepsen-2]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -48,12 +48,36 @@ jobs:
             mode_args: --replication async --failover lagged --expect lost-write
           - mode: unfenced-async
             mode_args: --replication async --failover unfenced --expect lost-write
+          # lease (slice 2): replicas on the agents under faults longer than
+          # the lease. valid: an agent cut off from the server, and the server
+          # cut off from Postgres; I1a, I1b (the measured overlap) and the
+          # fencing inequality must hold. wedged: the negative control, an
+          # agent stopped with SIGSTOP; passes only if I1b is caught broken.
+          # Both at fb385b2: at f7736a7 a fencing agent waits on a server
+          # watch between TERM and KILL, uncapped (agent_io_timeout_ms), so a
+          # cut-off agent kills ~8 s late and I1b fails by ~5.4 s; #225's fix
+          # (fence waits are pauses) removes that call. README "Findings".
+          - workload: lease
+            mode: valid
+            mode_args: --time-limit 200
+            zigcube: fb385b2d0d7e6beefd3225e71ae2bcf3437aa474
+          - workload: lease
+            mode: wedged
+            mode_args: --time-limit 120 --expect overlap --fault-ms 30000
+            zigcube: fb385b2d0d7e6beefd3225e71ae2bcf3437aa474
+          # late-kill: the valid schedule at f7736a7, whose late KILL must
+          # break I1b: a negative control of the protocol itself.
+          - workload: lease
+            mode: late-kill
+            mode_args: --time-limit 120 --expect overlap --lease-faults partition
+            zigcube: f7736a72f85c8ea21c1359c69a19539e00f0a5b9
     env:
       LEIN_VERSION: "2.11.2"
       # sha256 of bin/lein at the LEIN_VERSION tag; recompute when bumping it.
       LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
-      # Zigbox/zigcube main, 2026-11-12.
-      ZIGCUBE_COMMIT: f7736a72f85c8ea21c1359c69a19539e00f0a5b9
+      # Zigbox/zigcube main, 2026-11-12, unless the matrix entry names one
+      # (the lease jobs: main, 2026-11-13).
+      ZIGCUBE_COMMIT: ${{ matrix.zigcube || 'f7736a72f85c8ea21c1359c69a19539e00f0a5b9' }}
       ZIG_VERSION: "0.17.0"
       # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
       ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
@@ -62,7 +86,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check out Zigcube
-        if: matrix.workload == 'api'
+        if: matrix.workload != 'pg'
         uses: actions/checkout@v4
         with:
           repository: Zigbox/zigcube
@@ -70,7 +94,7 @@ jobs:
           path: zigcube
 
       - name: Cache the Zigcube build
-        if: matrix.workload == 'api'
+        if: matrix.workload != 'pg'
         id: zcube
         uses: actions/cache@v4
         with:
@@ -78,7 +102,7 @@ jobs:
           key: zigcube-${{ env.ZIGCUBE_COMMIT }}-zig-${{ env.ZIG_VERSION }}-ReleaseSafe-baseline
 
       - name: Build Zigcube
-        if: matrix.workload == 'api' && steps.zcube.outputs.cache-hit != 'true'
+        if: matrix.workload != 'pg' && steps.zcube.outputs.cache-hit != 'true'
         run: |
           archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
@@ -126,7 +150,7 @@ jobs:
       - name: Probe fault primitives
         run: docker/check-faults.sh
 
-      - name: Run register test
+      - name: Run the test
         run: |
           bin/lein run test \
             --workload "${{ matrix.workload }}" \
@@ -138,6 +162,7 @@ jobs:
           # The full log is in the artifact; show the nemesis trace and verdict.
           grep -E 'jepsen.util :nemesis' jepsen-stdout.log | cut -c1-220 || true
           grep -E 'write outage per failover' jepsen-stdout.log | cut -c1-300 || true
+          grep -E 'zcube-jepsen.core lease:' jepsen-stdout.log | cut -c1-400 || true
           tail -n 25 jepsen-stdout.log
           exit "$rc"
 

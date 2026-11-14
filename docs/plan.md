@@ -191,6 +191,60 @@ Open:
   state directory already holds usable start and stop times, or a watcher on
   the node must record them, is the first thing to find out.
 
+**Done (branch `claude/jepsen-2`).** `--workload lease`; README "The lease
+test". What changed from the plan above:
+
+- The fake runtime's state has no stop times, so every replica runs a
+  recorder that writes its own start, heartbeats and TERMs on the host clock.
+- I1a is replayed from a watch of the whole run, not by `GET /v1/list?at=`
+  per revision (the watch gives every revision in one pass). The store-side
+  cross-check (`store_log` on the primary) is not done.
+- Each service has one replica, so old and new instances are paired by
+  service; the server's decisions are not needed for the pairing.
+- The fencing inequality is checked from `src/constants.zig` of the Zigcube
+  that ran. It cannot be broken from here: `fence_margin_ms` is a constant
+  and the server refuses a ttl the margin cannot cover (ZC-E0121). The
+  smallest test-only switch, **proposed, not added** (Zigcube is read-only
+  from here): a teeth agent root `src/zcube_agent_fence_teeth.zig`, after
+  the `zcube_agent_teeth.zig` precedent, built as a separate
+  `zcube-agent-fence-teeth` whose agent breaks the inequality while the
+  server, checking the real constants, accepts ttl 10000. Lowering the
+  agent's margin alone (`c1_teeth_fence_margin_ms`) is **not enough**: the
+  KILL moves later by at most the margin (3 s), to about 200 - m ms past the
+  replacement's start, inside I1b's 1900 ms bound (which includes the lost
+  grace), so no checker here could tell. The switch that bites is the stop
+  term: `c1_teeth_fence_stop_ms` (say 8000) read by `fencing.kill_at_ms` on
+  the agent only. The KILL then lands ~7 s after the lease's end, and I1b
+  fails by ~5 s with no wedge, which is what `f7736a7`'s late KILL did by
+  accident (below), so CI also runs the valid schedule at `f7736a7` as a
+  second negative control (`lease / late-kill`, `--expect overlap --lease-faults partition`).
+  Meanwhile the first negative control is a SIGSTOPped agent node, which
+  must and does break I1b (20.6 s).
+- Finding: at `f7736a7` a fence's KILL comes ~8 s late on an agent cut off
+  from the server (README "Findings"); the lease jobs pin `fb385b2`, which
+  fixes it. `fb385b2` differs from `f7736a7` only in `agent_loop.zig`,
+  `agent.zig` (one line), `controller.zig`, build.zig and docs.
+- Review of PR #4 (two reviews): the verdict now also requires that the
+  faults happened (each kind completed and held ttl + grace), that the
+  records account for every assignment the watch saw, and that I1a had
+  something to check; I1b adds a per-instance kill-timing bound (TERM to
+  last heartbeat <= 2950 ms) and an upper bound from each recorder's
+  measured longest gap (over the window: `:unknown`). The recorder's start
+  is read on its first line; a wedge records the node's process states.
+  Unit tests cover the verdict conjunct by conjunct, the recorder and its
+  summary (run with the local bash and awk) and the schedule's shape; 57 of
+  58 single-point mutants of the checker, the summary and the schedule are
+  killed (the survivor, sanity without `(some? collect)`, is masked by the
+  records check). Not done: the recorder still stamps `CLOCK_REALTIME`
+  (an NTP step mid-run would shift overlaps; `/proc/uptime` has only 10 ms
+  resolution), the nemesis itself has no tests without a cluster, and no
+  check ties a handover to the fault window it came from.
+- Not reached: the model's FINDINGS 1 (stale registration PUT re-attaching
+  an orphan lease: needs an agent restart or a connection broken with the
+  PUT in flight) and 2 (no lost grace for a second expiry: needs a node
+  controller a whole lease behind). Both are for slice 3/4 faults; the I1b
+  checker applies unchanged.
+
 ## Slice 3: a forward step of the store's clock (#238 finding 3)
 
 #238 finding 3 (`finding-store-setback`): lease deadlines are absolute values

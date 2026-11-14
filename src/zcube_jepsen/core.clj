@@ -1,5 +1,6 @@
 (ns zcube-jepsen.core
-  (:require [clojure.tools.logging :refer [info]]
+  (:require [clojure.java.io :as io]
+            [clojure.tools.logging :refer [info]]
             [jepsen [checker :as checker]
                     [cli :as cli]
                     [client :as client]
@@ -12,6 +13,8 @@
             [knossos.model :as model]
             [zcube-jepsen [api :as api]
                           [checkers :as checkers]
+                          [lease :as lease]
+                          [lease-checkers :as lc]
                           [nemesis :as zn]
                           [postgres :as pg]
                           [register :as register]
@@ -168,9 +171,135 @@
                          (gen/log "Reading the store directly")
                          (gen/nemesis {:type :info :f :store-read}))})))
 
+;; ---------------------------------------------------------------- lease
+
+(defn lease-schedule
+  "valid: an agent cut off from the server, then the server cut off from
+  Postgres, each for longer than the lease (the ttl plus the lost grace and
+  then some, so that the node is lost and its replicas are replaced).
+  wedge (the negative control): an agent stopped with SIGSTOP as long.
+  --lease-faults picks one; by default wedge with --expect overlap, else
+  partition. A --fault-ms shorter than ttl + lost grace is refused: no node
+  would be lost, and the checker would not count the faults."
+  [opts]
+  (let [min-hold (+ (:lease-ttl-ms opts) (:lost-grace-ms opts))
+        _    (when (< (:fault-ms opts) min-hold)
+               (throw (IllegalArgumentException.
+                        (str "--fault-ms " (:fault-ms opts) " is shorter than"
+                             " ttl + lost grace (" min-hold " ms)"))))
+        hold (gen/sleep (/ (:fault-ms opts) 1000))
+        gap  (gen/sleep 15)]
+    (case (lc/fault-kind (:lease-faults opts) (:expect opts))
+      :wedge (cycle [gap {:type :info :f :wedge} hold
+                       {:type :info :f :unwedge}])
+      :partition
+      (cycle [gap {:type :info :f :isolate-agent} hold {:type :info :f :heal}
+              gap {:type :info :f :isolate-store} hold {:type :info :f :heal}]))))
+
+(defn lease-checker
+  "zcube-jepsen.lease-checkers/analyze over the history, with the constants
+  of the Zigcube that ran (read from its src/constants.zig)."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [ops     (filter #(not= :invoke (:type %)) history)
+            collect (->> ops (filter #(= :collect (:f %))) last :value)
+            text    (slurp (io/file (:zcube-constants test)))]
+        (let [r (lc/analyze {:constants     (lc/parse-constants text)
+                     :ttl           (:lease-ttl-ms test)
+                     :grace         (:lost-grace-ms test)
+                     :collect       (when (map? collect) collect)
+                     :applies       (filter #(and (= :apply (:f %))
+                                                  (number? (:process %)))
+                                            ops)
+                     ; A nemesis op is :info both when invoked and when
+                     ; done; the completion is the one with a value.
+                     :faults        (filter #(and (= :nemesis (:process %))
+                                                  (some? (:value %))
+                                                  (not= :collect (:f %)))
+                                            ops)
+                     :expect        (:expect test)
+                     :fault-kind    (lc/fault-kind (:lease-faults test)
+                                                   (:expect test))
+                     :min-handovers (:min-handovers test)})]
+            (info "lease:" (pr-str
+                             {:valid? (:valid? r) :expected (:expected r)
+                              :i1a (select-keys (:i1a r) [:valid? :revisions-checked
+                                                          :replicas-assigned :gaps])
+                              :i1b (-> (:i1b r)
+                                       (select-keys [:valid? :overlap-valid? :bound-ms
+                                                     :max-overlap-ms :max-overlap-upper-ms
+                                                     :max-heartbeat-gap-ms :handovers
+                                                     :cross-node-handovers])
+                                       (assoc :kill (dissoc (:kill (:i1b r)) :violations)))
+                              :fencing (select-keys (:fencing r) [:valid? :ttl-ms :fence-margin-ms
+                                                                  :margin-needed-ms :i1b-bound-ms])
+                              :sanity (-> (:sanity r)
+                                          (update :faults dissoc :windows))}))
+            (info "lease: overlaps (ms, negative = a gap):"
+                  (pr-str (:all-overlaps-ms (:i1b r))))
+            r)))))
+
+(defn lease-test
+  [opts]
+  (let [n (:services opts)]
+    (merge tests/noop-test
+           opts
+           {:name      (str "zcube-lease-" (name (:expect opts))
+                             (some->> (:lease-faults opts) name (str "-")))
+            :os        os/noop
+            :db        (lease/db)
+            :client    (lease/client)
+            :nemesis   (lease/lease-nemesis)
+            :checker   (checker/compose
+                         {:lease    (lease-checker)
+                          :timeline (timeline/html)})
+            :generator (gen/phases
+                         (gen/log "Applying services of one replica")
+                         (gen/clients (for [k (range n)]
+                                        {:type :invoke :f :apply :value k}))
+                         (gen/log "Letting them be placed and started")
+                         (gen/sleep 15)
+                         (->> (gen/stagger 2 (repeat {:type :invoke :f :read}))
+                              (gen/nemesis (lease-schedule opts))
+                              (gen/time-limit (:time-limit opts)))
+                         (gen/log "Healing")
+                         (gen/nemesis [{:type :info :f :heal}
+                                       {:type :info :f :unwedge}])
+                         (gen/log "Letting the replicas settle")
+                         (gen/sleep 30)
+                         (gen/clients {:type :invoke :f :read})
+                         (gen/log "Collecting the watch and the records")
+                         (gen/nemesis {:type :info :f :collect}))})))
+
+(defn any-test
+  [opts]
+  (if (= "lease" (:workload opts))
+    (lease-test opts)
+    (register-test opts)))
+
 (def cli-opts
-  [[nil "--workload NAME" "pg (the store alone) or api (through zcube-server)."
-    :default "api" :validate [workloads "must be pg or api"]]
+  [[nil "--workload NAME"
+    (str "pg (the store alone), api (through zcube-server), or lease (leases"
+         " and fencing: replicas on the agents, I1a, I1b, the inequality).")
+    :default "api" :validate [#(or (workloads %) (= "lease" %))
+                              "must be pg, api or lease"]]
+   [nil "--zcube-constants FILE"
+    "lease: the src/constants.zig of the Zigcube that runs."
+    :default "zigcube/src/constants.zig"]
+   [nil "--lost-grace-ms N" "zcube-server's --lost-grace-ms."
+    :default 1000 :parse-fn parse-long]
+   [nil "--services N" "lease: services of one replica."
+    :default 6 :parse-fn parse-long]
+   [nil "--fault-ms N" "lease: how long each fault holds (longer than the ttl)."
+    :default 25000 :parse-fn parse-long]
+   [nil "--lease-faults KIND"
+    "lease: partition (an agent from the server, the server from Postgres) or wedge (SIGSTOP an agent node). Default: wedge with --expect overlap, else partition."
+    :parse-fn keyword
+    :validate [#{:partition :wedge} "must be partition or wedge"]]
+   [nil "--min-handovers N"
+    "lease: fail the run if fewer replicas were replaced onto another node."
+    :default 1 :parse-fn parse-long]
    [nil "--zcube-bin DIR" "Directory holding zcube-server and zcube-agent."
     :default "zigcube/zig-out/bin"]
    [nil "--zcube-images FILE" "The fake runtime's image list."
@@ -198,9 +327,11 @@
     :validate [#{:sync :async} "must be sync or async"]]
    [nil "--expect OUTCOME"
     (str "valid: the run must find nothing. lost-write: the negative control;"
-         " the run passes only if the checkers catch a loss.")
+         " the run passes only if the checkers catch a loss. overlap (lease):"
+         " the wedged-agent control; passes only if I1b is caught broken.")
     :default :valid :parse-fn keyword
-    :validate [#{:valid :lost-write} "must be valid or lost-write"]]
+    :validate [#{:valid :lost-write :overlap}
+               "must be valid, lost-write or overlap"]]
    [nil "--repoint-delay-ms N" "unfenced, api only: how long zcube-server stays on the old primary (pg clients have no repoint)."
     :default 5000 :parse-fn parse-long]
    [nil "--lag-ms N" "lagged: how long the standby is cut off before promotion."
@@ -210,7 +341,7 @@
     :default true]])
 
 (defn -main [& args]
-  (cli/run! (merge (cli/single-test-cmd {:test-fn  register-test
+  (cli/run! (merge (cli/single-test-cmd {:test-fn  any-test
                                          :opt-spec cli-opts})
                    (cli/serve-cmd))
             args))

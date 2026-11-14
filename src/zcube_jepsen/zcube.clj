@@ -45,6 +45,7 @@
                     " connect_timeout=3")
       :--state-dir (str state-dir "/server")
       :--lease-ttl-ms (:lease-ttl-ms test 10000)
+      :--lost-grace-ms (:lost-grace-ms test 1000)
       :--create-store)))
 
 (defn stop-server! []
@@ -90,7 +91,8 @@
   (c/su (c/exec :bash :-c
                 ; [z]: so that -f does not match this very shell.
                 (str "pkill -9 -x zcube-server; pkill -9 -x zcube-agent; "
-                     "pkill -9 -f '[z]cube-agent supervise'; true"))))
+                     "pkill -9 -f '[z]cube-agent supervise'; "
+                     "pkill -9 -f '[z]j-rec.sh'; true"))))
 
 (defn install! [test role]
   (let [bin (:zcube-bin test)]
