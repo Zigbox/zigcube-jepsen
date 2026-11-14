@@ -123,8 +123,10 @@ This is #237's liveness note, reproduced: the node cannot come back until the
 agent restarts.
 
 This history's `:orphan-keepalives` is empty because of a path-matching bug in
-the check (it missed `?known=`). That bug was fixed after the run; the CI runs
-of the idle variant have the count.
+the check (it missed `?known=`). That bug was fixed after the run. In CI run
+43533838746, the idle variant counted 9 keepalives on L2 answered 200 after
+the stale PUT landed, and n4 was lost for 20358 ms. The running variant
+counted 8 before the agent fenced.
 
 ## How to run it
 
