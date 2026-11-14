@@ -8,13 +8,17 @@
   granted L2 and registers on it. Work is placed on n4 and starts. The proxy
   then delivers the held PUT, while L1 is still live. The server applies a
   registration with no compare, so on an affected server /nodes/n4 moves back
-  to L1 at a new revision: n4's tenure changes under the agent, which still
-  renews L2, and when L1 ends the node is taken for lost while its containers
-  are still up. n5 starts afterwards and is where the replacements go.
+  to L1 at a new revision: n4's tenure changes under an agent that still
+  renews L2.
 
   Steps, each an op in the history (the nemesis does them in order):
-    :arm :start-agent :await-held :kill-agent :start-agent :await-registered
-    :apply :await-running :release :start-agent(n5) :observe :collect
+    :arm :start-agent(n4) :await-held :kill-agent :start-agent(n4)
+    :await-registered, then
+      --release-after running:    :apply :await-running :release
+      --release-after registered: :release :apply
+    with :start-agent(n5) just before the release (--spare-at before) or
+    just after it, then :observe :collect. --services 0 applies nothing: the
+    idle node of #237's liveness note.
 
   What is checked, from the store's log (zcube.store_log, read at the end):
     stale-registrations  I2: a put of /nodes/<node> on a lower lease than an
@@ -99,7 +103,9 @@
                     (c/exec :rm :-rf zcube/state-dir))
               (zcube/install! test :agent)
               (c/su (c/exec :mkdir :-p (str zcube/state-dir "/agent")))
-              (c/upload (str (io/resource "proc-watch.sh")) watcher)
+              (let [f (java.io.File/createTempFile "proc-watch" ".sh")]
+                (spit f (slurp (io/resource "proc-watch.sh")))
+                (c/upload (str f) watcher))
               (c/su (c/exec :chmod :+x watcher))
               (start-watcher!)
               (zcube/await-server! test))
@@ -262,8 +268,7 @@
                [(svc-name i) (:status res) (-> res :body :revision)])))
 
       :await-running
-      (if (= :registered (:release-after test))
-        :skipped
+      (do
         (let [r (poll! (deadline)
                        (fn []
                          (let [kvs (list-prefix http test (str "/observed/" n4 "/"))
@@ -424,7 +429,7 @@
   the stale registration put back."
   [proxy-log release l1]
   (vec (for [r proxy-log
-             :let [[_ lease] (re-matches #"/v1/agent/nodes/[^/]+/lease/(\d+)/keepalive" (str (:path r)))]
+             :let [[_ lease] (re-matches #"/v1/agent/nodes/[^/]+/lease/(\d+)/keepalive(?:\?.*)?" (str (:path r)))]
              :when (and lease (= 200 (:status r)) (> (:at r) (:answered release))
                         (not= l1 (parse-long lease)))]
          (select-keys r [:at :path]))))
@@ -514,11 +519,20 @@
 
 ;; ---------------------------------------------------------------- test
 
-(defn steps [test]
-  (let [n4 (held-node test) n5 (spare-node test)]
-    (->> [[:arm] [:start-agent n4] [:await-held] [:kill-agent n4]
-          [:start-agent n4] [:await-registered] [:apply] [:await-running]
-          [:release] [:start-agent n5] [:observe] [:collect]]
+(defn steps
+  "running: the release comes once n4 reports its replicas running.
+  registered: it comes right after n4 registered on L2, before the apply."
+  [test]
+  (let [n4 (held-node test) n5 (spare-node test)
+        release (if (= :before (:spare-at test))
+                  [[:start-agent n5] [:release]]
+                  [[:release] [:start-agent n5]])]
+    (->> (concat [[:arm] [:start-agent n4] [:await-held] [:kill-agent n4]
+                  [:start-agent n4] [:await-registered]]
+                 (if (= :registered (:release-after test))
+                   (concat release [[:apply]])
+                   (concat [[:apply] [:await-running]] release))
+                 [[:observe] [:collect]])
          (mapv (fn [[f v]] {:type :info :f f :value v})))))
 
 (defn stale-put-test [opts]
@@ -550,6 +564,11 @@
          " any work (case b).")
     :default :running :parse-fn keyword
     :validate [#{:running :registered} "must be running or registered"]]
+   [nil "--spare-at WHEN"
+    (str "before: start n5's agent just before the release, so a replacement"
+         " has somewhere to go at once. after: just after it.")
+    :default :before :parse-fn keyword
+    :validate [#{:before :after} "must be before or after"]]
    [nil "--[no-]ignore-term" "The replicas' command ignores SIGTERM, so a stop takes stop_grace."
     :default true]
    [nil "--observe-s N" "Seconds to watch after the release."

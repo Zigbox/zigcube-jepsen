@@ -197,11 +197,18 @@
       (let [o (.getOutputStream s)]
         (.write o bytes)
         (.flush o)
-        (let [answer (.readAllBytes (.getInputStream s))
-              text   (String. answer StandardCharsets/UTF_8)
+        ; The server may keep the connection open after answering, so read
+        ; the head and then content-length bytes, not up to EOF.
+        (let [in     (.getInputStream s)
+              head   (read-head in)
+              _      (when-not head (throw (java.io.IOException. "no answer")))
+              n      (or (:content-length (parse-head (str "X / HTTP/1.1\r\n"
+                                                           (second (str/split (head-text head) #"\r\n" 2)))))
+                         0)
+              body   (.readNBytes in (int n))
               r      {:sent sent :answered (now-ms)
-                      :status (status-of answer (alength answer))
-                      :body (second (str/split text #"\r\n\r\n" 2))}]
+                      :status (status-of head (alength head))
+                      :body (String. body StandardCharsets/UTF_8)}]
           (reset! (:released proxy) r)
           (log! proxy {:method "PUT" :path (str "/v1/agent/nodes/" (:node proxy))
                        :at sent :status (:status r) :end (:answered r)
