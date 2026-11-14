@@ -4,11 +4,12 @@ Slices after the first. Each names what it adds, what it checks, and what it
 needs. Invariant names (I1a..I7, J1..J11, the fencing inequality) refer to
 Zigcube's `docs/authority.md` and job documentation.
 
-> Issues #237 and #238 could not be read from the session that wrote this
-> (its GitHub access covers only this repository, and no document in the
-> Zigcube tree quotes them). What each finding says, and how it reproduces,
-> must be filled in from the issues before slices 3 to 5 are built. Items
-> marked **(to confirm)** are assumptions.
+> #237 and #238 were read on 2026-11-14 (Zigcube issues, both open, filed
+> 2026-11-12 from Zigbox/zigcube-tla's FINDINGS.md; line numbers there are at
+> zigcube `f7736a7`). Slices 3 to 5 below follow their text. On zigcube main
+> at `fb385b2` (2026-11-13) neither is fixed: `register` in
+> `src/agent_api.zig` still PUTs `/nodes/<node>` with no compare, the
+> keepalive still looks only at the lease, and the constants are unchanged.
 
 ## Slice 1b: remainder (done on `claude/jepsen-1b`, green in CI)
 
@@ -190,48 +191,72 @@ Open:
   state directory already holds usable start and stop times, or a watcher on
   the node must record them, is the first thing to find out.
 
-## Slice 3: clock steps (#238 finding 3)
+## Slice 3: a forward step of the store's clock (#238 finding 3)
 
-- Fault: skew and step the clock of one process (agent, then server) with
-  libfaketime: `FAKETIME_TIMESTAMP_FILE` rewritten by the nemesis.
-- First task: establish whether libfaketime affects the Zigcube binaries at
-  all (static linking, raw syscalls, vDSO; see README). If not, choose
-  between a test-only clock offset in the binaries and KVM guests.
-- The agent's fencing deadline is on `CLOCK_BOOTTIME` and the inequality
-  bounds clock **rate** skew, not absolute values. A wall-clock step should
-  therefore change nothing, and the fault that matters is a rate change
-  (`faketime -f '+0 x1.05'`) with `FAKETIME_DONT_FAKE_MONOTONIC` off, if
-  libfaketime reaches `CLOCK_BOOTTIME` at all. Neither is a clock a container
-  can change for real.
-- Checker: slice 2's overlap checker. Records must carry both the faked wall
-  clock and the true monotonic clock so overlap is measured in real time.
-- Expected: reproduces finding 3 **(to confirm against the issue)**.
+#238 finding 3 (`finding-store-setback`): lease deadlines are absolute values
+of the **store's** clock. Postgres expires a lease by `clock_timestamp()`
+(`src/store_postgres.zig:163`), SQLite by wall time, so a forward step of the
+database host's clock (an NTP step, a VM resume, a failover to a standby whose
+clock is ahead) shortens every lease at once. authority.md (line 261) says
+absolute clock values do not matter; for the store they do. The agent learns
+of it only as `LeaseNotFound` on its next keepalive and fences at once, which
+bounds the overlap by the renewal interval plus the fence time, not by the I1b
+window.
 
-## Slice 4: SIGSTOP of an agent (#238 finding 4)
+- Fault: step the clock of the **Postgres primary** forward by more than
+  `ttl - renewal interval` (several seconds), with libfaketime under
+  `postgres` (`FAKETIME_TIMESTAMP_FILE` rewritten by the nemesis; Postgres is
+  dynamically linked, so libfaketime should reach `clock_timestamp()`; check
+  it first). A variant: fail over to a standby started with its clock ahead.
+- Not the agent's clock: the agent fences on `CLOCK_BOOTTIME`, which a
+  wall-clock step does not move, and the inequality bounds clock **rates**,
+  which no container can change. A rate fault on the agent stays a later,
+  separate item (libfaketime's reach into the static Zig binaries is still
+  unknown; README).
+- Checker: slice 2's overlap checker (records in real time from the agents),
+  and I1a throughout.
+- Expected: an overlap of a replaced replica's old and new instances longer
+  than `lost_grace_ms` + kill latency (1.9 s), bounded by the renewal interval
+  plus `fence_stop_ms` + kill latency. #238's repair is the owner's choice (a
+  stated bound on forward steps, or deadlines on a store-side monotonic
+  counter); until then the run is an expected failure.
 
-- Fault: SIGSTOP an agent for longer than its lease, then SIGCONT, alone and
-  combined with a partition. The classic paused-leaseholder case: the agent
-  resumes believing it still holds the lease.
-- Checker: overlap from the agents' records; FakeRuntime must timestamp a
-  "still running" heartbeat record so a resumed copy is visible.
-- `docs/authority.md` already states that the I1b bound fails for a wedged
-  node ("the agent is frozen") and that nothing on the server can know. So an
-  overlap here is the documented limit; the run measures how long it lasts
-  after SIGCONT, and checks that I1a still holds throughout.
-- Expected: reproduces finding 4 **(to confirm against the issue)**.
+## Slice 4: a late agent step, by SIGSTOP (#238 finding 4)
 
-## Slice 5: the stale register PUT (#237)
+#238 finding 4 (`finding-step-lag`): the agent checks its fence at the start
+of a reconcile step (`src/agent.zig:479-482`), so a step that starts `d` late
+fences `d` late. `fence_margin >= fence_stop_ms + ttl * skew + kill latency`
+is met with equality (`src/constants.zig:132-157`), so any lag comes out of
+`lost_grace_ms` (1000 ms), and a lag above it is an overlap. authority.md
+assumes the agent "alive and scheduled" with no number.
 
-- "Register" here is most likely the agent's node registration,
-  `PUT /v1/agent/nodes/{node}`, not the register workload **(to confirm)**:
-  a registration from an old tenure that arrives after a newer one.
-- Workload: an agent client driven by the test (or a real agent behind a
-  proxy that can hold a request), delayed by a partition or SIGSTOP so its
-  PUT arrives after the node registered again.
-- Checker: I1a's second half, at most one tenure per node under which an
-  observation is admissible, and I2, no transaction commits under a
-  superseded tenure, read from the store's history.
-- Expected: a history showing #237 **(to confirm)**.
+- Fault: partition an agent from the server (keepalives fail), then SIGSTOP
+  it shortly before its fence time `s + ttl - fence_margin` for `d` = 0.5,
+  1.5 and 3 s, then SIGCONT. The fence time comes from the agent's
+  `lease.json` (`sent_ms`, on `CLOCK_BOOTTIME`, which containers share with
+  the host).
+- Checker: overlap from the agents' records (slice 2), and I1a throughout.
+- Expected: no overlap beyond the window for `d` under `lost_grace_ms`, and an
+  overlap of about `d - lost_grace_ms` above it. That is finding 4: the
+  inequality has no term for step lag.
+- A SIGSTOP longer than the lease is the wedged node that authority.md already
+  names as outside the I1b bound; run it too, report the overlap after
+  SIGCONT as measured, not as a violation, and check that I1a holds.
+
+## Slice 5: the stale registration PUT (#237)
+
+"Register" is the agent's node registration,
+`PUT /v1/agent/nodes/{node}` (`register` in `src/agent_api.zig`), which the
+server applies with no compare. #237 (TLA+ finding 1): a registration PUT whose
+agent restarted, or whose connection broke, is still at the server and lands
+after the agent's next registration. `/nodes/<node>` then sits on the
+abandoned lease L1, which nobody renews, while the agent's keepalives on L2 go
+on succeeding (they look only at the lease). L1 expires, the node is lost, and
+after `lost_grace_ms` its replicas are replaced while the agent is `held` with
+its containers running. A timed-out PUT cannot do it (the agent's timeout is
+the ttl, so its lease is gone); a restart or a broken connection can.
+
+Done on `claude/jepsen-5`: `docs/stale-put.md`.
 
 ## Slice 6: jobs (J1..J11)
 
@@ -252,3 +277,8 @@ Open:
   failover is done, slice 1b).
 - Longer and randomised schedules as a nightly job; the push job stays short.
 - A table in the README mapping each invariant to the test that checks it.
+- #238 finding 2 (`finding-spent-grace`): the lost grace is counted from the
+  first `lost` record, so a node that is lost, registers again and expires
+  again before the node controller judges the new tenure is replaced with no
+  grace. Not planned in a slice yet; it needs two expiries of one node close
+  together (a partition, a short heal, a partition).

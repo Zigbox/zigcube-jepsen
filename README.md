@@ -166,8 +166,7 @@ clock-offset test hook in the binaries, or KVM guests with their own clocks.
   not build Zigcube locally (its Zigbox dependency could not be fetched
   there).
 - Authority invariants (I1a..I7), job invariants (J1..J11), and the model
-  findings in Zigcube #237 and #238: see `docs/plan.md`. The text of #237
-  and #238 has not been read yet.
+  findings in Zigcube #237 and #238: see `docs/plan.md`.
 
 ## Layout
 
