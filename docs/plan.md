@@ -256,7 +256,7 @@ after `lost_grace_ms` its replicas are replaced while the agent is `held` with
 its containers running. A timed-out PUT cannot do it (the agent's timeout is
 the ttl, so its lease is gone); a restart or a broken connection can.
 
-Done on `claude/jepsen-5`; see the section after slice 6.
+Done on `claude/jepsen-5`: `docs/stale-put.md`.
 
 ## Slice 6: jobs (J1..J11)
 
