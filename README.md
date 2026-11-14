@@ -6,16 +6,18 @@ for linearizability of the store, the authority invariants and the job
 invariants. It lives out of the Zigcube tree by decision (Clojure and
 Leiningen are allowed here, not there).
 
-**Status: slices 1 and 2 done.** Five nodes, the fault primitives, a
+**Status: slices 1, 2 and 5 done.** Five nodes, the fault primitives, a
 register test through `zcube-server`'s API under partitions and Postgres
 failover, and a lease test (I1a, the I1b overlap measured on the agents, the
-fencing inequality) with a wedged-agent negative control. What the test does not yet do is listed under
+fencing inequality) with a wedged-agent negative control, and the stale
+registration PUT of #237 as an expected-failure test (`docs/stale-put.md`). What the test does not yet do is listed under
 [What is not covered yet](#what-is-not-covered-yet).
 
 ## What runs
 
 Two register tests on the same cluster and the same fault schedule, and the
-lease test ([below](#the-lease-test-slice-2)).
+lease test ([below](#the-lease-test-slice-2)). The stale registration PUT
+(slice 5) has its own test and CI workflow: `docs/stale-put.md`.
 
 | Part       | What it is |
 |------------|------------|
@@ -267,16 +269,15 @@ clock-offset test hook in the binaries, or KVM guests with their own clocks.
   cross-checked against the store log. One replica per service, so the
   old/new pairing is by service, not from the server's decisions. No agent
   restart and no connection broken with a registration in flight, so the
-  model's FINDINGS 1 (a stale registration PUT) and 2 (no grace for a second
-  expiry) are not reached. `fence_margin_ms` cannot be lowered without
+  model's FINDINGS 2 (no grace for a second expiry) is not reached; FINDINGS 1
+  (a stale registration PUT) is slice 5's test (`docs/stale-put.md`). `fence_margin_ms` cannot be lowered without
   changing Zigcube, so there is no negative control for the inequality
   itself (`docs/plan.md`, slice 2).
 - **The api workload has run only in CI.** The session that wrote it could
   not build Zigcube locally (its Zigbox dependency could not be fetched
   there).
 - Authority invariants (I1a..I7), job invariants (J1..J11), and the model
-  findings in Zigcube #237 and #238: see `docs/plan.md`. The text of #237
-  and #238 has not been read yet.
+  findings in Zigcube #237 and #238: see `docs/plan.md`.
 
 ## Layout
 
