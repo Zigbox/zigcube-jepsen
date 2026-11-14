@@ -196,18 +196,34 @@
       (let [ops     (filter #(not= :invoke (:type %)) history)
             collect (->> ops (filter #(= :collect (:f %))) last :value)
             text    (slurp (io/file (:zcube-constants test)))]
-        (lc/analyze {:constants     (lc/parse-constants text)
+        (let [r (lc/analyze {:constants     (lc/parse-constants text)
                      :ttl           (:lease-ttl-ms test)
                      :grace         (:lost-grace-ms test)
                      :collect       (when (map? collect) collect)
                      :applies       (filter #(and (= :apply (:f %))
                                                   (number? (:process %)))
                                             ops)
+                     ; A nemesis op is :info both when invoked and when
+                     ; done; the completion is the one with a value.
                      :faults        (filter #(and (= :nemesis (:process %))
+                                                  (some? (:value %))
                                                   (not= :collect (:f %)))
                                             ops)
                      :expect        (:expect test)
-                     :min-handovers (:min-handovers test)})))))
+                     :min-handovers (:min-handovers test)})]
+            (info "lease:" (pr-str
+                             {:valid? (:valid? r) :expected (:expected r)
+                              :i1a (select-keys (:i1a r) [:valid? :revisions-checked
+                                                          :replicas-assigned :gaps])
+                              :i1b (select-keys (:i1b r) [:valid? :bound-ms :max-overlap-ms
+                                                          :max-overlap-upper-ms :handovers
+                                                          :cross-node-handovers])
+                              :fencing (select-keys (:fencing r) [:valid? :ttl-ms :fence-margin-ms
+                                                                  :margin-needed-ms :i1b-bound-ms])
+                              :sanity (:sanity r)}))
+            (info "lease: overlaps (ms, negative = a gap):"
+                  (pr-str (:all-overlaps-ms (:i1b r))))
+            r)))))
 
 (defn lease-test
   [opts]

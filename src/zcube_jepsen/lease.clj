@@ -182,14 +182,18 @@
                       (warn "watch compacted at" from)
                       (swap! st #(-> %
                                      (update :gaps conj {:from from
-                                                         :resumed (inc (:revision r))})
-                                     (assoc :from (inc (:revision r))))))
-                (do (swap! st #(-> % (update :errors inc)
-                                   (assoc :last-error [status (api/code {:body body})])))
-                    (Thread/sleep 500))))
+                                                         :resumed (inc (-> r :store :revision))})
+                                     (assoc :from (inc (-> r :store :revision))))))
+                (let [s (swap! st #(-> % (update :errors inc)
+                                       (assoc :last-error [status (api/code {:body body})])))]
+                  (when (= 1 (mod (:errors s) 20))
+                    (info "watch: from" from "error" (:errors s) (:last-error s)))
+                  (Thread/sleep 500))))
             (catch Throwable e
-              (swap! st #(-> % (update :errors inc)
-                             (assoc :last-error (str e))))
+              (let [s (swap! st #(-> % (update :errors inc)
+                                     (assoc :last-error (str e))))]
+                (when (= 1 (mod (:errors s) 20))
+                  (info "watch: from" from "error" (:errors s) (:last-error s))))
               (Thread/sleep 500))))))
     st))
 
@@ -200,7 +204,7 @@
         base (str "http://" (zcube/server-node test) ":" zcube/port)
         head (util/await-fn
                (fn [] (let [r (get-json http (str base "/v1/status") 10)]
-                        (or (some-> r :body :revision)
+                        (or (some-> r :body :store :revision)
                             (throw (ex-info "no status" r)))))
                {:retry-interval 1000 :timeout 60000})]
     (util/await-fn
@@ -271,7 +275,14 @@
                 (assoc op :value :all))
 
             :collect
-            (let [w     (finish-watch! test @watch)
+            (let [w     (try (finish-watch! test @watch)
+                             (catch Throwable e
+                               (warn e "the watch did not catch up")
+                               (swap! @watch assoc :running? false)
+                               (assoc @@watch
+                                      :gaps (conj (:gaps @@watch)
+                                                  {:from (:from @@watch)
+                                                   :error :did-not-catch-up}))))
                   insts (records test)]
               (info "watch:" (count (:events w)) "events up to revision" (:head w)
                     "gaps" (:gaps w) "errors" (:errors w))
