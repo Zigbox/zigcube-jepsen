@@ -95,17 +95,37 @@ Both use 10 workers, 2 per key, 60 ops per key.
     3000 >= 2000 + 100 + 900, slack 0.
   - **I1a**: the watch replayed revision by revision; at every revision each
     replica id has at most one `/assigned/<node>/<id>`. A gap makes it
-    `:unknown`, which fails.
+    `:unknown`, which fails; so does having nothing to check (no assignment
+    put, or none deleted) and an event type other than put and delete.
   - **I1b**: per service (one replica, so any two instances of it are an old
     instance and its replacement), each instance's overlap with every earlier
     one, from the records: `min(ends) - max(starts)`, where an end is the
     last heartbeat or TERM. Bound: `lost_grace_ms + fence_kill_latency_ms` =
-    1900 ms. The measured maximum is reported; it is a lower bound, at most
-    one heartbeat (50 ms) short.
-  - **sanity**: every apply `:ok`, the collect happened, at least
-    `--min-handovers` (1) handovers across nodes.
-- **Verdict.** `valid`: all four hold. `overlap` (the negative control):
-  sanity, fencing and I1a hold and I1b fails.
+    1900 ms. Each overlap has a lower bound (the last lines written) and an
+    upper bound (each end moved out by the longest gap that instance's
+    recorder left between two lines, measured, at least 50 ms). A lower
+    bound over the window fails I1b; an upper bound over it with no lower
+    bound over it is `:unknown`, which also fails a valid run. Both maxima
+    are reported, and the longest recorder gap.
+  - **kill timing** (part of I1b): for every instance that noted a TERM,
+    TERM to last heartbeat <= `fence_stop_ms + fence_kill_latency_ms` + one
+    heartbeat = 2950 ms. This does not depend on when the replacement
+    started, so a late KILL cannot hide behind a later replacement (the store
+    partition at `f7736a7`, below, had 10.16 s).
+  - **sanity**: every apply `:ok`; the collect happened; at least
+    `--min-handovers` (1) handovers across nodes; **the faults happened**:
+    each fault of the schedule (an agent cut off and the store cut off, or a
+    wedge with every `zcube-agent` process of the node seen in state `T`)
+    completed and was healed at least ttl + lost grace later (a fault the
+    time limit cut shorter does not count); **the records are complete**:
+    every `/assigned/<node>/<replica>` the watch saw has a record on that
+    node (unless it lasted under 3 s by the watch's receipt times, too short
+    to have started), no assignment has more records than it had periods,
+    no record is of no assignment, every record has a start and a
+    heartbeat, and no record file lacks its start line.
+- **Verdict.** `valid`: all of the above hold. `overlap` (the negative
+  control): sanity, fencing and I1a hold and I1b's overlap fails with
+  certainty (a late kill alone is not an overlap).
 
 The lease jobs build Zigcube at `fb385b2` (main, 2026-11-13), not `f7736a7`:
 see the finding below.

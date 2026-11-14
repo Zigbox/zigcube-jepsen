@@ -223,6 +223,21 @@ test". What changed from the plan above:
   from the server (README "Findings"); the lease jobs pin `fb385b2`, which
   fixes it. `fb385b2` differs from `f7736a7` only in `agent_loop.zig`,
   `agent.zig` (one line), `controller.zig`, build.zig and docs.
+- Review of PR #4 (two reviews): the verdict now also requires that the
+  faults happened (each kind completed and held ttl + grace), that the
+  records account for every assignment the watch saw, and that I1a had
+  something to check; I1b adds a per-instance kill-timing bound (TERM to
+  last heartbeat <= 2950 ms) and an upper bound from each recorder's
+  measured longest gap (over the window: `:unknown`). The recorder's start
+  is read on its first line; a wedge records the node's process states.
+  Unit tests cover the verdict conjunct by conjunct, the recorder and its
+  summary (run with the local bash and awk) and the schedule's shape; 57 of
+  58 single-point mutants of the checker, the summary and the schedule are
+  killed (the survivor, sanity without `(some? collect)`, is masked by the
+  records check). Not done: the recorder still stamps `CLOCK_REALTIME`
+  (an NTP step mid-run would shift overlaps; `/proc/uptime` has only 10 ms
+  resolution), the nemesis itself has no tests without a cluster, and no
+  check ties a handover to the fault window it came from.
 - Not reached: the model's FINDINGS 1 (stale registration PUT re-attaching
   an orphan lease: needs an agent restart or a connection broken with the
   PUT in flight) and 2 (no lost grace for a second expiry: needs a node

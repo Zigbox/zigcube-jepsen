@@ -179,14 +179,20 @@
   then some, so that the node is lost and its replicas are replaced).
   wedge (the negative control): an agent stopped with SIGSTOP as long.
   --lease-faults picks one; by default wedge with --expect overlap, else
-  partition."
+  partition. A --fault-ms shorter than ttl + lost grace is refused: no node
+  would be lost, and the checker would not count the faults."
   [opts]
-  (let [hold (gen/sleep (/ (:fault-ms opts) 1000))
+  (let [min-hold (+ (:lease-ttl-ms opts) (:lost-grace-ms opts))
+        _    (when (< (:fault-ms opts) min-hold)
+               (throw (IllegalArgumentException.
+                        (str "--fault-ms " (:fault-ms opts) " is shorter than"
+                             " ttl + lost grace (" min-hold " ms)"))))
+        hold (gen/sleep (/ (:fault-ms opts) 1000))
         gap  (gen/sleep 15)]
-    (case (or (:lease-faults opts)
-              (if (= :overlap (:expect opts)) :wedge :partition))
+    (case (lc/fault-kind (:lease-faults opts) (:expect opts))
       :wedge (cycle [gap {:type :info :f :wedge} hold
                        {:type :info :f :unwedge}])
+      :partition
       (cycle [gap {:type :info :f :isolate-agent} hold {:type :info :f :heal}
               gap {:type :info :f :isolate-store} hold {:type :info :f :heal}]))))
 
@@ -213,17 +219,23 @@
                                                   (not= :collect (:f %)))
                                             ops)
                      :expect        (:expect test)
+                     :fault-kind    (lc/fault-kind (:lease-faults test)
+                                                   (:expect test))
                      :min-handovers (:min-handovers test)})]
             (info "lease:" (pr-str
                              {:valid? (:valid? r) :expected (:expected r)
                               :i1a (select-keys (:i1a r) [:valid? :revisions-checked
                                                           :replicas-assigned :gaps])
-                              :i1b (select-keys (:i1b r) [:valid? :bound-ms :max-overlap-ms
-                                                          :max-overlap-upper-ms :handovers
-                                                          :cross-node-handovers])
+                              :i1b (-> (:i1b r)
+                                       (select-keys [:valid? :overlap-valid? :bound-ms
+                                                     :max-overlap-ms :max-overlap-upper-ms
+                                                     :max-heartbeat-gap-ms :handovers
+                                                     :cross-node-handovers])
+                                       (assoc :kill (dissoc (:kill (:i1b r)) :violations)))
                               :fencing (select-keys (:fencing r) [:valid? :ttl-ms :fence-margin-ms
                                                                   :margin-needed-ms :i1b-bound-ms])
-                              :sanity (:sanity r)}))
+                              :sanity (-> (:sanity r)
+                                          (update :faults dissoc :windows))}))
             (info "lease: overlaps (ms, negative = a gap):"
                   (pr-str (:all-overlaps-ms (:i1b r))))
             r)))))

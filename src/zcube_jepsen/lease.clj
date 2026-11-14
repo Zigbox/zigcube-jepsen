@@ -37,7 +37,7 @@
 (def records-dir (str zcube/state-dir "/rec"))
 (def heartbeat-ms lc/heartbeat-ms*)
 
-(def recorder
+(defn recorder-script
   "The command of every replica. Its parent is the FakeRuntime supervisor,
   `zcube-agent supervise <state>/containers/<replica id>`, so the replica id
   is the last word of the parent's command line. One file per instance
@@ -45,30 +45,48 @@
     S <epoch s.us> <service> <replica> <pid>   once, at start
     H <epoch s.us>                             every heartbeat
     T <epoch s.us>                             at each TERM (ignored)
-  The sleep is `read -t` on a FIFO held open by the script itself: a builtin,
-  so no fork per heartbeat and a TERM is noted at once."
+  The start is read on the script's first line, before the forks that find
+  the id, so that it is as close to the process's start as the script can
+  get. The sleep is `read -t` on a FIFO held open by the script itself: a
+  builtin, so no fork per heartbeat and a TERM is noted at once. `dir` is
+  where the files go."
+  [dir]
   (str "#!/bin/bash\n"
-       "d=" records-dir "\n"
+       "t0=$EPOCHREALTIME\n"
+       "d=" dir "\n"
        "mkdir -p \"$d\"\n"
        "id=$(tr '\\0' '\\n' < /proc/$PPID/cmdline | tail -n 1)\n"
        "id=${id##*/}\n"
        "f=\"$d/$id.$$.log\"\n"
        "p=\"$d/.fifo.$$\"\n"
        "mkfifo \"$p\" && exec 3<>\"$p\" && rm -f \"$p\"\n"
-       "echo \"S $EPOCHREALTIME ${ZJ_SVC:-?} $id $$\" >> \"$f\"\n"
+       "echo \"S $t0 ${ZJ_SVC:-?} $id $$\" >> \"$f\"\n"
        "trap 'echo \"T $EPOCHREALTIME\" >> \"$f\"' TERM\n"
        "while :; do\n"
        "  echo \"H $EPOCHREALTIME\" >> \"$f\"\n"
        "  read -t " (format "%.3f" (/ heartbeat-ms 1000.0)) " -u 3 _\n"
        "done\n"))
 
-(def summarize
-  "One line per instance file: svc replica pid start last-heartbeat term."
-  (str "for f in " records-dir "/*.log; do [ -e \"$f\" ] || continue; "
-       "awk 'NR==1{svc=$3; id=$4; pid=$5; start=$2} "
-       "$1==\"H\"{last=$2} $1==\"T\" && term==\"\"{term=$2} "
-       "END{if (start!=\"\") print svc, id, pid, start, "
-       "(last==\"\" ? \"-\" : last), (term==\"\" ? \"-\" : term)}' \"$f\"; done"))
+(def recorder (recorder-script records-dir))
+
+(defn summarize
+  "A shell command printing one line per instance file in `dir`:
+    svc replica pid start last-heartbeat term max-gap
+  (max-gap: the longest time between two consecutive lines of the file,
+  i.e. how long the recorder may go without writing; `-` when the file has
+  one line), or `E <file> no-start` for a file whose first line is not a
+  start line (it is reported, not skipped)."
+  ([] (summarize records-dir))
+  ([dir]
+   (str "for f in " dir "/*.log; do [ -e \"$f\" ] || continue; "
+        "awk -v f=\"$f\" '"
+        "NR==1{if ($1!=\"S\") {bad=1; exit} svc=$3; id=$4; pid=$5; start=$2; prev=$2; next} "
+        "{g=$2-prev; if (NR==2 || g>gap) gap=g; prev=$2} "
+        "$1==\"H\"{last=$2} $1==\"T\" && term==\"\"{term=$2} "
+        "END{if (bad || start==\"\") print \"E\", f, \"no-start\"; "
+        "else print svc, id, pid, start, (last==\"\" ? \"-\" : last), "
+        "(term==\"\" ? \"-\" : term), (NR<2 ? \"-\" : sprintf(\"%.6f\", gap))}' "
+        "\"$f\"; done")))
 
 (defn svc-name [k] (str "l" k "x"))
 
@@ -173,10 +191,15 @@
                 200 (swap! st (fn [s]
                                 (-> s
                                     (update :events into
-                                            (for [e (:events body)]
-                                              {:rev  (-> e :kv :mod_revision)
-                                               :type (keyword (:type e))
-                                               :key  (-> e :kv :key)}))
+                                            (let [t (System/currentTimeMillis)]
+                                              (for [e (:events body)]
+                                                {:rev  (-> e :kv :mod_revision)
+                                                 :type (keyword (:type e))
+                                                 :key  (-> e :kv :key)
+                                                 ; when the watch got it: an
+                                                 ; assignment's length, for
+                                                 ; the records check
+                                                 :t    t})))
                                     (assoc :from (inc (:revision body))))))
                 410 (let [r (:body (get-json http (str base "/v1/status") 10))]
                       (warn "watch compacted at" from)
@@ -212,7 +235,7 @@
         true)
       {:retry-interval 500 :timeout 60000 :log-message "watch catching up"})
     (swap! st assoc :running? false)
-    (assoc @st :head head)))
+    (assoc @st :head head :finished-at (System/currentTimeMillis))))
 
 ;; ---------------------------------------------------------------- nemesis
 
@@ -220,14 +243,21 @@
   (c/on-nodes test nodes (fn [_ _] (c/su (f)))))
 
 (defn records
-  "Every instance every agent node recorded."
+  "Every instance every agent node recorded, and every record file a node
+  could not summarize: {:instances [...] :errors [...]}."
   [test]
-  (->> (c/on-nodes test (zcube/agent-nodes test)
-                   (fn [_ node] (c/su (c/exec :bash :-c summarize))))
-       (mapcat (fn [[node out]]
-                 (keep #(lc/parse-record-line node %) (str/split-lines out))))
-       (sort-by :start)
-       vec))
+  (let [rs (->> (c/on-nodes test (zcube/agent-nodes test)
+                            (fn [_ node] (c/su (c/exec :bash :-c (summarize)))))
+                (map (fn [[node out]] (lc/parse-records node out))))]
+    {:instances (vec (sort-by :start (mapcat :instances rs)))
+     :errors    (vec (mapcat :errors rs))}))
+
+(defn stopped?
+  "Whether `ps -o stat=` output lists at least one process and every one of
+  them is stopped (state T)."
+  [out]
+  (let [ls (remove str/blank? (str/split-lines (or out "")))]
+    (boolean (and (seq ls) (every? #(str/starts-with? (str/trim %) "T") ls)))))
 
 (defn lease-nemesis
   "Handles
@@ -265,9 +295,17 @@
                 (assoc op :value :healed))
 
             :wedge
-            (let [n (pick)]
-              (on-agents test [n] #(c/exec :pkill :-STOP :-x "zcube-agent"))
-              (assoc op :value n))
+            ; Checked after the fact: a wedge that stopped nothing (a renamed
+            ; process) shows as :stopped? false, and does not count as one.
+            (let [n   (pick)
+                  out (get (on-agents test [n]
+                                      #(c/exec :bash :-c
+                                               (str "pkill -STOP -x zcube-agent; "
+                                                    "sleep 0.2; "
+                                                    "ps -o stat= -C zcube-agent; true")))
+                           n)]
+              (assoc op :value {:node n :stat (str/trim (str out))
+                                :stopped? (stopped? out)}))
 
             :unwedge
             (do (on-agents test (zcube/agent-nodes test)
@@ -283,15 +321,19 @@
                                       :gaps (conj (:gaps @@watch)
                                                   {:from (:from @@watch)
                                                    :error :did-not-catch-up}))))
-                  insts (records test)]
+                  recs  (records test)]
               (info "watch:" (count (:events w)) "events up to revision" (:head w)
                     "gaps" (:gaps w) "errors" (:errors w))
-              (info "recorded instances:" (count insts))
+              (info "recorded instances:" (count (:instances recs))
+                    "record errors:" (pr-str (:errors recs)))
               (assoc op :value {:events    (:events w)
                                 :gaps      (:gaps w)
                                 :head      (:head w)
+                                :finished-at (or (:finished-at w)
+                                                 (System/currentTimeMillis))
                                 :watch-errors (:errors w)
-                                :instances insts})))))
+                                :instances (:instances recs)
+                                :record-errors (:errors recs)})))))
 
       (teardown! [_ test]
         (some-> @watch (swap! assoc :running? false))
