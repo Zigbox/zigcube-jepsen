@@ -126,7 +126,7 @@ see the finding below.
   replacements came 10 s later. `fb385b2` (#225, "fence waits are pauses,
   not watches") removes the call: the same run there gives a 2.9 s gap
   before every replacement. #225 was filed for a busy loop after a restart;
-  this is a second effect of the same wait, and the TLA model's FINDINGS
+  this is a second effect of the same wait (`docs/findings/2026-11-14-late-fence-kill-f7736a7.md`), and the TLA model's FINDINGS
   item 4 (no term for a late KILL step) is the gap in the model that let it
   through. Reported to the supervisor, not filed.
 
