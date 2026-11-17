@@ -1,0 +1,66 @@
+name: gcp-sweeper
+
+# Deletes what a GCP Jepsen run (gcp.yml) left behind: instances labelled
+# purpose=jepsen and zj-* networks (with their routers, NAT, firewall rules
+# and subnets) older than max_age_hours. Fails if it found anything, so a
+# broken teardown shows up as a red run. Same keyless auth as gcp.yml; the
+# WIF provider admits main only, and schedules run on the default branch.
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: Delete what is older than this many hours
+        default: "4"
+      dry_run:
+        description: List only
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - gcp/sweep.sh
+      - .github/workflows/gcp-sweeper.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gcp-sweeper-${{ github.event_name == 'pull_request' && github.ref || 'live' }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: sweep
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      MAX_AGE_HOURS: ${{ inputs.max_age_hours || '4' }}
+      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Sweep
+        run: gcp/sweep.sh
+
+  check:
+    name: shellcheck (offline)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: shellcheck gcp/sweep.sh

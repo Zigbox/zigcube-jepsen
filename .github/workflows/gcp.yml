@@ -1,0 +1,295 @@
+name: gcp
+
+# Jepsen on real GCP VMs. A dispatch on main creates the cluster with
+# OpenTofu (tofu/), runs the selected tests from a control VM inside the
+# VPC, collects the results as an artifact, and destroys everything in a
+# job that always runs. Pull requests get offline checks only: the
+# Workload Identity Federation provider admits this repository on
+# refs/heads/main alone, so nothing else can reach GCP.
+# docs/decisions/2026-11-17-gcp-opentofu.md; README "Running on GCP".
+
+on:
+  workflow_dispatch:
+    inputs:
+      zigcube_ref:
+        description: Zigbox/zigcube commit, branch or tag to build
+        default: fb385b2d0d7e6beefd3225e71ae2bcf3437aa474
+      tests:
+        description: >-
+          Space-separated, run in order: {api,pg}-{fenced,unfenced,negative-control,unfenced-async},
+          lease-{valid,wedged,late-kill}, stale-put-{running,registered,idle}
+        default: api-fenced pg-fenced lease-valid lease-wedged
+      time_limit:
+        description: Seconds of load and faults per register test (lease tests take at least their CI limits)
+        default: "120"
+  pull_request:
+    paths:
+      - tofu/**
+      - gcp/**
+      - .github/workflows/gcp.yml
+      - .github/workflows/gcp-sweeper.yml
+
+permissions:
+  contents: read
+
+# Live runs queue behind each other (never cancelled mid-way: the teardown
+# must run); pull requests are grouped per ref.
+concurrency:
+  group: gcp-${{ github.event_name == 'workflow_dispatch' && 'live' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TOFU_VERSION: "1.13.9"
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  offline:
+    name: offline checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: tofu fmt
+        run: tofu -chdir=tofu fmt -check -recursive -diff
+
+      - name: tofu validate
+        run: |
+          tofu -chdir=tofu init -backend=false -lockfile=readonly
+          tofu -chdir=tofu validate
+
+      - name: tofu test (plan against a mocked provider)
+        run: tofu -chdir=tofu test
+
+      - name: shellcheck
+        run: shellcheck gcp/*.sh tofu/scripts/*.sh
+
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+        run: |
+          # Built from the tagged module (Go is on the runner), so there is no
+          # binary checksum to keep up to date.
+          GOBIN="$RUNNER_TEMP/bin" go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
+          "$RUNNER_TEMP/bin/actionlint" -color
+
+  live:
+    name: run on GCP
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ZIGCUBE_REF: ${{ inputs.zigcube_ref }}
+      TESTS: ${{ inputs.tests }}
+      TIME_LIMIT: ${{ inputs.time_limit }}
+      RUN_ID: ${{ github.run_id }}
+      ZONE: ${{ vars.GCP_ZONE }}
+      ZIG_VERSION: "0.17.0"
+      # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
+      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      RESULTS: ${{ github.workspace }}/results
+    steps:
+      - name: Check the inputs
+        run: |
+          [[ "$ZIGCUBE_REF" =~ ^[0-9A-Za-z._/-]+$ ]] || { echo "::error::bad zigcube_ref"; exit 1; }
+          [[ "$TESTS" =~ ^[a-z0-9\ -]+$ ]] || { echo "::error::bad tests"; exit 1; }
+          if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || [ "$TIME_LIMIT" -lt 30 ] || [ "$TIME_LIMIT" -gt 1800 ]; then
+            echo "::error::time_limit must be 30 to 1800"; exit 1
+          fi
+          for v in GCP_PROJECT_ID GCP_REGION GCP_ZONE TF_STATE_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::repository variable $v is not set"; exit 1; }
+          done
+          echo "CREATED_UNIX=$(date +%s)" >> "$GITHUB_ENV"
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_ZONE: ${{ vars.GCP_ZONE }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check out Zigcube
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Zigbox/zigcube
+          ref: ${{ inputs.zigcube_ref }}
+          path: zigcube
+
+      - name: Build Zigcube and pack the bundle
+        run: |
+          archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+          echo "${ZIG_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          zig="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}/zig"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpq-dev libsqlite3-dev
+          cd zigcube
+          "$zig" build -Doptimize=ReleaseSafe -Dcpu=baseline
+          b="${RUNNER_TEMP}/bundle"
+          mkdir -p "$b/bin"
+          cp zig-out/bin/zcube-server zig-out/bin/zcube-agent "$b/bin/"
+          cp fixtures/images.zon "$b/images.zon"
+          cp src/constants.zig "$b/constants.zig"
+          git rev-parse HEAD > "$b/COMMIT"
+          # Zigcube's release bundle, where this ref has one (zigcube#277);
+          # shipped alongside, the harness still uses bin/.
+          if "$zig" build -l | grep -qE '^\s+dist\b'; then
+            "$zig" build dist -Doptimize=ReleaseSafe -Dcpu=baseline
+            mkdir -p "$b/dist" && cp -r zig-out/. "$b/dist/"
+          fi
+          tar -czf "${RUNNER_TEMP}/zigcube.tar.gz" -C "$b" .
+          find "$b" -type f -printf '%s\t%p\n' | head -40
+          echo "zigcube $(cat "$b/COMMIT")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pack the harness
+        # git archive: only tracked files, so the auth action's credential
+        # config in the workspace is never shipped.
+        run: git archive --format=tar.gz -o "${RUNNER_TEMP}/harness.tar.gz" HEAD
+
+      - name: Throwaway SSH key for root on the nodes
+        run: ssh-keygen -q -t ed25519 -N '' -C "zj-${RUN_ID}" -f "${RUNNER_TEMP}/zj-key"
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: tofu apply
+        env:
+          TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+          TF_VAR_region: ${{ vars.GCP_REGION }}
+          TF_VAR_zone: ${{ vars.GCP_ZONE }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          export TF_VAR_run_id="$RUN_ID" TF_VAR_created_unix="$CREATED_UNIX"
+          TF_VAR_root_ssh_public_key="$(cat "${RUNNER_TEMP}/zj-key.pub")"
+          export TF_VAR_root_ssh_public_key
+          tofu -chdir=tofu init -lockfile=readonly \
+            -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="prefix=runs/${RUN_ID}"
+          tofu -chdir=tofu apply -auto-approve
+          echo "CONTROL=$(tofu -chdir=tofu output -raw control_name)" >> "$GITHUB_ENV"
+          {
+            echo "state: gs://${TF_STATE_BUCKET}/runs/${RUN_ID}"
+            echo "image: $(tofu -chdir=tofu output -raw image)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for the control VM (SSH over IAP)
+        run: gcp/ci.sh wait-ssh
+
+      - name: Ship the harness, the Zigcube bundle and the key
+        run: gcp/ci.sh ship "${RUNNER_TEMP}/harness.tar.gz" "${RUNNER_TEMP}/zigcube.tar.gz" "${RUNNER_TEMP}/zj-key"
+
+      - name: Run the tests on the control VM
+        run: |
+          gcp/ci.sh start "$TESTS" "$TIME_LIMIT"
+          gcp/ci.sh wait
+
+      - name: Collect the results
+        if: always() && env.CONTROL != ''
+        run: |
+          gcp/ci.sh fetch && rc=0 || rc=$?
+          if [ -f "$RESULTS/out/summary.tsv" ]; then
+            {
+              echo '| test | exit | seconds | store |'
+              echo '|---|---|---|---|'
+              tail -n +2 "$RESULTS/out/summary.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" |"}'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          for f in "$RESULTS"/out/logs/*.log; do
+            case "$f" in */lein-deps.log) continue ;; esac
+            echo "::group::$(basename "$f")"
+            grep -E 'jepsen.util :nemesis' "$f" | cut -c1-220 || true
+            grep -E 'write outage per failover|zcube-jepsen.core lease:' "$f" | cut -c1-400 || true
+            tail -n 25 "$f"
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jepsen-gcp-${{ github.run_id }}
+          path: results/
+          retention-days: 14
+          if-no-files-found: warn
+
+  teardown:
+    name: tofu destroy
+    needs: live
+    # Whatever happened to the run, cancelled included.
+    if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: tofu destroy
+        env:
+          TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+          TF_VAR_region: ${{ vars.GCP_REGION }}
+          TF_VAR_zone: ${{ vars.GCP_ZONE }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          # Destroy needs a value; it is not used.
+          TF_VAR_root_ssh_public_key: ssh-ed25519 destroy
+        run: |
+          export TF_VAR_run_id="$RUN_ID"
+          tofu -chdir=tofu init -lockfile=readonly \
+            -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="prefix=runs/${RUN_ID}"
+          for i in 1 2 3; do
+            tofu -chdir=tofu destroy -auto-approve && exit 0
+            echo "destroy attempt $i failed; retrying"
+            sleep 30
+          done
+          echo "::error::tofu destroy failed: state gs://${TF_STATE_BUCKET}/runs/${RUN_ID}; see README 'Tearing down by hand'"
+          exit 1
+
+      - name: Nothing of this run is left
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          left=$(gcloud --project "$PROJECT" compute instances list \
+                   --filter="labels.run_id=${RUN_ID}" --format='value(name)')
+          nets=$(gcloud --project "$PROJECT" compute networks list \
+                   --filter="name=zj-${RUN_ID}-net" --format='value(name)')
+          if [ -n "$left$nets" ]; then
+            echo "::error::left after destroy: $left $nets"
+            exit 1
+          fi
+          echo "run ${RUN_ID}: nothing left"
