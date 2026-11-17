@@ -237,7 +237,7 @@ pull request and every push to `main` and the `claude/` branches, and uploads `s
 ## Running on GCP
 
 `.github/workflows/gcp.yml` runs the same tests on six GCP VMs (five nodes
-`n1`..`n5`, `e2-standard-4`, and a control VM, `e2-standard-2`, that runs lein
+`n1`..`n5`, `e2-standard-2`, and a control VM, `e2-standard-2`, that runs lein
 and Jepsen inside the VPC), all created by OpenTofu (`tofu/`) and destroyed
 again by the same workflow. Auth is Workload Identity Federation only, with
 no keys, and only from `main`, so pull requests get offline checks (`tofu fmt`,
@@ -285,10 +285,10 @@ output (`<vm>.serial.log`, the startup script's progress and errors) and,
 if the control VM was reachable, the startup and sshd journals of every VM.
 
 **Cost.** About $0.75 an hour while the cluster is up (on-demand
-us-central1: 5 x e2-standard-4 about $0.67, e2-standard-2 about $0.07, six
+us-central1: 5 x e2-standard-2 about $0.35, e2-standard-2 about $0.07, six
 20 GB balanced disks and the NAT gateway a few cents), plus NAT data
 processing for apt and Maven (well under $0.10). The default four tests take
-about 40 to 60 minutes including setup: roughly $0.50 to $1 per run.
+about 40 to 60 minutes including setup: roughly $0.35 to $0.50 per run.
 
 **If the `tofu destroy` job failed**, re-run that job alone: open the run,
 click the `tofu destroy` job, and use **Re-run job** there (same state
