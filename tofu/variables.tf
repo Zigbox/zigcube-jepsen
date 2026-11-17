@@ -58,9 +58,9 @@ variable "node_count" {
 }
 
 variable "node_machine_type" {
-  description = "Machine type of the nodes. 5 x e2-standard-4 + 1 x e2-standard-2 = 22 vCPU, under the regional quota of 24."
+  description = "Machine type of the nodes. 5 x e2-standard-2 + 1 x e2-standard-2 control = 12 vCPU, the project's global CPU quota (CPUS_ALL_REGIONS)."
   type        = string
-  default     = "e2-standard-4"
+  default     = "e2-standard-2"
 }
 
 variable "control_machine_type" {
