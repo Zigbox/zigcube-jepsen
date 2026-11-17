@@ -34,9 +34,11 @@ ready=/var/lib/zj-ready
 role=$(md zj-role)
 subnet=$(md zj-subnet)
 
-# Names first, on every boot.
-sed -i '/ # zcube-jepsen$/d' /etc/hosts
-md zj-hosts | sed 's/$/ # zcube-jepsen/' >> /etc/hosts
+# Names first, on every boot. Rewritten in place, not with sed -i (which
+# renames a new file over it), so this also works where /etc/hosts is a
+# bind mount, as in a container (tofu/tests/startup-sshd.sh).
+hosts=$(grep -v ' # zcube-jepsen$' /etc/hosts || true)
+{ printf '%s\n' "$hosts"; md zj-hosts | sed 's/$/ # zcube-jepsen/'; } > /etc/hosts
 
 if [ -f "$ready" ]; then
   echo "zcube-jepsen: $role already set up"
