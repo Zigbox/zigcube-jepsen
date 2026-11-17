@@ -1,11 +1,19 @@
 name: gcp
 
-# Jepsen on real GCP VMs. A dispatch on main creates the cluster with
+# Jepsen on real GCP VMs. A dispatch on main checks the inputs, builds
+# Zigcube in a job that cannot get a GCP token, creates the cluster with
 # OpenTofu (tofu/), runs the selected tests from a control VM inside the
 # VPC, collects the results as an artifact, and destroys everything in a
 # job that always runs. Pull requests get offline checks only: the
 # Workload Identity Federation provider admits this repository on
 # refs/heads/main alone, so nothing else can reach GCP.
+#
+# Only `run on GCP` and `tofu destroy` may ask for an OIDC token
+# (id-token: write), and they run nothing but this repository's own code
+# from main: the Zigcube ref (any branch, tag or commit of Zigbox/zigcube,
+# so possibly someone else's code) is built in `build`, which has no
+# id-token permission, and reaches the live job as an artifact that is only
+# copied, never unpacked or run, on the runner.
 # docs/decisions/2026-11-17-gcp-opentofu.md; README "Running on GCP".
 
 on:
@@ -29,11 +37,13 @@ on:
       - .github/workflows/gcp.yml
       - .github/workflows/gcp-sweeper.yml
 
-permissions:
-  contents: read
+# Each job asks for what it needs.
+permissions: {}
 
-# Live runs queue behind each other (never cancelled mid-way: the teardown
-# must run); pull requests are grouped per ref.
+# Live runs go one at a time and are never cancelled mid-way (the teardown
+# must run). GitHub keeps at most one *pending* run per group: a dispatch
+# made while another run waits replaces (cancels) the waiting one, which
+# has created nothing yet. Pull requests are grouped per ref.
 concurrency:
   group: gcp-${{ github.event_name == 'workflow_dispatch' && 'live' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -49,8 +59,12 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
@@ -69,7 +83,19 @@ jobs:
         run: tofu -chdir=tofu test
 
       - name: shellcheck
-        run: shellcheck gcp/*.sh tofu/scripts/*.sh
+        run: shellcheck gcp/*.sh gcp/tests/*.sh tofu/scripts/*.sh tofu/tests/*.sh
+
+      - name: dispatch input checks (allow-list, time budget)
+        run: gcp/check-inputs.sh --self-test
+
+      - name: sweeper and teardown against stub gcloud and tofu
+        run: |
+          bash gcp/tests/sweep-test.sh
+          bash gcp/tests/tofu-destroy-test.sh
+
+      - name: node startup script's sshd on Ubuntu 24.04 (sshd -T)
+        # A throwaway container: the test rewrites /etc/ssh and /root.
+        run: docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 bash /w/tofu/tests/startup-sshd.sh
 
       - name: actionlint
         env:
@@ -80,50 +106,58 @@ jobs:
           GOBIN="$RUNNER_TEMP/bin" go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
           "$RUNNER_TEMP/bin/actionlint" -color
 
-  live:
-    name: run on GCP
+  inputs:
+    name: check the inputs
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 5
     permissions:
       contents: read
-      id-token: write
-    env:
-      ZIGCUBE_REF: ${{ inputs.zigcube_ref }}
-      TESTS: ${{ inputs.tests }}
-      TIME_LIMIT: ${{ inputs.time_limit }}
-      RUN_ID: ${{ github.run_id }}
-      ZONE: ${{ vars.GCP_ZONE }}
-      ZIG_VERSION: "0.17.0"
-      # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
-      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
-      RESULTS: ${{ github.workspace }}/results
     steps:
-      - name: Check the inputs
-        run: |
-          [[ "$ZIGCUBE_REF" =~ ^[0-9A-Za-z._/-]+$ ]] || { echo "::error::bad zigcube_ref"; exit 1; }
-          [[ "$TESTS" =~ ^[a-z0-9\ -]+$ ]] || { echo "::error::bad tests"; exit 1; }
-          if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || [ "$TIME_LIMIT" -lt 30 ] || [ "$TIME_LIMIT" -gt 1800 ]; then
-            echo "::error::time_limit must be 30 to 1800"; exit 1
-          fi
-          for v in GCP_PROJECT_ID GCP_REGION GCP_ZONE TF_STATE_BUCKET; do
-            [ -n "${!v}" ] || { echo "::error::repository variable $v is not set"; exit 1; }
-          done
-          echo "CREATED_UNIX=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Inputs and repository variables
         env:
+          ZIGCUBE_REF: ${{ inputs.zigcube_ref }}
+          TESTS: ${{ inputs.tests }}
+          TIME_LIMIT: ${{ inputs.time_limit }}
+          # The live job's timeout-minutes, below; keep the two equal.
+          LIVE_TIMEOUT_MIN: "150"
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GCP_ZONE: ${{ vars.GCP_ZONE }}
           TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          gcp/check-inputs.sh
+          for v in GCP_PROJECT_ID GCP_REGION GCP_ZONE TF_STATE_BUCKET GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT; do
+            [ -n "${!v}" ] || { echo "::error::repository variable $v is not set"; exit 1; }
+          done
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
+  build:
+    name: build Zigcube (no GCP access)
+    needs: inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # No id-token: this job runs the Zigcube ref's build.zig, which may be
+    # anyone's code.
+    permissions:
+      contents: read
+    env:
+      ZIG_VERSION: "0.17.0"
+      # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
+      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+    steps:
       - name: Check out Zigcube
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Zigbox/zigcube
           ref: ${{ inputs.zigcube_ref }}
           path: zigcube
+          persist-credentials: false
 
       - name: Build Zigcube and pack the bundle
         run: |
@@ -137,7 +171,7 @@ jobs:
           cd zigcube
           "$zig" build -Doptimize=ReleaseSafe -Dcpu=baseline
           b="${RUNNER_TEMP}/bundle"
-          mkdir -p "$b/bin"
+          mkdir -p "$b/bin" "${RUNNER_TEMP}/out"
           cp zig-out/bin/zcube-server zig-out/bin/zcube-agent "$b/bin/"
           cp fixtures/images.zon "$b/images.zon"
           cp src/constants.zig "$b/constants.zig"
@@ -148,9 +182,47 @@ jobs:
             "$zig" build dist -Doptimize=ReleaseSafe -Dcpu=baseline
             mkdir -p "$b/dist" && cp -r zig-out/. "$b/dist/"
           fi
-          tar -czf "${RUNNER_TEMP}/zigcube.tar.gz" -C "$b" .
+          tar -czf "${RUNNER_TEMP}/out/zigcube.tar.gz" -C "$b" .
           find "$b" -type f -printf '%s\t%p\n' | head -40
           echo "zigcube $(cat "$b/COMMIT")" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zigcube-bundle-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/zigcube.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  live:
+    name: run on GCP
+    needs: [inputs, build]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # check-inputs.sh's budget assumes 150; keep LIVE_TIMEOUT_MIN equal.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Checked by the inputs job; only ever used quoted, from the environment.
+      TESTS: ${{ inputs.tests }}
+      TIME_LIMIT: ${{ inputs.time_limit }}
+      RUN_ID: ${{ github.run_id }}
+      ZONE: ${{ vars.GCP_ZONE }}
+      CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      RESULTS: ${{ github.workspace }}/results
+    steps:
+      - run: echo "CREATED_UNIX=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Data only: copied to the control VM as it is, never unpacked here.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: zigcube-bundle-${{ github.run_id }}
+          path: ${{ runner.temp }}/in
 
       - name: Pack the harness
         # git archive: only tracked files, so the auth action's credential
@@ -196,7 +268,7 @@ jobs:
         run: gcp/ci.sh wait-ssh
 
       - name: Ship the harness, the Zigcube bundle and the key
-        run: gcp/ci.sh ship "${RUNNER_TEMP}/harness.tar.gz" "${RUNNER_TEMP}/zigcube.tar.gz" "${RUNNER_TEMP}/zj-key"
+        run: gcp/ci.sh ship "${RUNNER_TEMP}/harness.tar.gz" "${RUNNER_TEMP}/in/zigcube.tar.gz" "${RUNNER_TEMP}/zj-key"
 
       - name: Run the tests on the control VM
         run: |
@@ -224,6 +296,12 @@ jobs:
           done
           exit "$rc"
 
+      - name: Diagnostics (serial output, startup journals)
+        # Whenever the run failed, the cluster got that far or not: a VM
+        # that never became ready says why only here.
+        if: failure()
+        run: gcp/ci.sh diag
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -236,8 +314,11 @@ jobs:
   teardown:
     name: tofu destroy
     needs: live
-    # Whatever happened to the run, cancelled included.
-    if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # Whatever happened to the run, cancelled included; not when the live
+    # job never started (bad inputs, failed build: nothing was created).
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+      && needs.live.result != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -245,8 +326,11 @@ jobs:
       id-token: write
     env:
       RUN_ID: ${{ github.run_id }}
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -272,24 +356,22 @@ jobs:
           export TF_VAR_run_id="$RUN_ID"
           tofu -chdir=tofu init -lockfile=readonly \
             -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="prefix=runs/${RUN_ID}"
-          for i in 1 2 3; do
-            tofu -chdir=tofu destroy -auto-approve && exit 0
-            echo "destroy attempt $i failed; retrying"
-            sleep 30
-          done
-          echo "::error::tofu destroy failed: state gs://${TF_STATE_BUCKET}/runs/${RUN_ID}; see README 'Tearing down by hand'"
-          exit 1
+          # A run cancelled during apply leaves its state lock behind (the
+          # runner kills tofu seconds after the cancel). By now the live job
+          # is over and the concurrency group admits no other run, so a lock
+          # on this run's own state is stale: remove it and go on.
+          gcp/tofu-destroy.sh
+
+      - name: Delete what is left of this run (not in the state, or not destroyed)
+        # After a cancelled apply, GCE may have created resources tofu never
+        # wrote to the state. Found and deleted is not a failure here.
+        if: always()
+        env:
+          FOUND_EXIT: "0"
+        run: gcp/sweep.sh
 
       - name: Nothing of this run is left
+        if: always()
         env:
-          PROJECT: ${{ vars.GCP_PROJECT_ID }}
-        run: |
-          left=$(gcloud --project "$PROJECT" compute instances list \
-                   --filter="labels.run_id=${RUN_ID}" --format='value(name)')
-          nets=$(gcloud --project "$PROJECT" compute networks list \
-                   --filter="name=zj-${RUN_ID}-net" --format='value(name)')
-          if [ -n "$left$nets" ]; then
-            echo "::error::left after destroy: $left $nets"
-            exit 1
-          fi
-          echo "run ${RUN_ID}: nothing left"
+          DRY_RUN: "1"
+        run: gcp/sweep.sh

@@ -4,23 +4,25 @@
 # account (gcloud uses the Workload Identity Federation credentials the auth
 # action set up; nothing here reads or prints a token).
 #
-# Env: ZONE, CONTROL (the control VM's name), RESULTS (local directory).
+# Env: ZONE, CONTROL (the control VM's name; diag works without it),
+# RESULTS (local directory), RUN_ID (diag).
 # Usage: ci.sh wait-ssh | ship <harness.tar.gz> <zigcube.tar.gz> <key>
-#        | start "<tests>" <time-limit> | wait | fetch
+#        | start "<tests>" <time-limit> | wait | fetch | diag
 set -euo pipefail
 
-: "${ZONE:?}" "${CONTROL:?}"
+: "${ZONE:?}"
 
 # One OS Login key per run, expiring on its own so the service account's
-# login profile does not fill up.
+# login profile does not fill up. T=<seconds> bounds one call (0: no bound).
 gssh() {
-  gcloud compute ssh "$CONTROL" --zone "$ZONE" --tunnel-through-iap --quiet \
+  : "${CONTROL:?}"
+  timeout "${T:-0}" gcloud compute ssh "$CONTROL" --zone "$ZONE" --tunnel-through-iap --quiet \
     --strict-host-key-checking=no --ssh-key-expire-after=6h \
     --command "$1" -- -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o LogLevel=ERROR
 }
 
 gscp() {
-  gcloud compute scp --zone "$ZONE" --tunnel-through-iap --quiet \
+  timeout "${T:-0}" gcloud compute scp --zone "$ZONE" --tunnel-through-iap --quiet \
     --strict-host-key-checking=no "$@"
 }
 
@@ -34,7 +36,7 @@ case "${1:-}" in
       sleep 15
     done
     echo "::error::control VM not reachable over IAP, or its startup script did not finish"
-    gssh 'sudo tail -n 50 /var/log/syslog' || true
+    T=120 gssh 'sudo journalctl -u google-startup-scripts --no-pager | tail -n 80' || true
     exit 1
     ;;
 
@@ -59,13 +61,21 @@ case "${1:-}" in
     ;;
 
   wait)
-    # The job's timeout bounds this.
-    seen=0
+    # The job's timeout bounds the run; this bounds a control VM that is
+    # gone (deleted, or failed with automatic_restart off): 10 failed polls
+    # in a row, about 10 to 20 minutes, and it gives up.
+    seen=0 failures=0
     while :; do
       sleep 60
-      if ! status=$(gssh "tail -n +$((seen + 1)) ~/zj/out/run.log 2>/dev/null; echo \"@exit=\$(cat ~/zj/out/exit 2>/dev/null)\"" 2>/dev/null); then
-        echo "(poll failed, retrying)"; continue
+      if ! status=$(T=300 gssh "tail -n +$((seen + 1)) ~/zj/out/run.log 2>/dev/null; echo \"@exit=\$(cat ~/zj/out/exit 2>/dev/null)\"" 2>/dev/null); then
+        failures=$((failures + 1))
+        if [ "$failures" -ge 10 ]; then
+          echo "::error::$failures polls of the control VM failed in a row; giving up"
+          exit 1
+        fi
+        echo "(poll failed, $failures in a row, retrying)"; continue
       fi
+      failures=0
       lines=$(printf '%s\n' "$status" | grep -v '^@exit=' || true)
       if [ -n "$lines" ]; then
         printf '%s\n' "$lines"
@@ -93,8 +103,45 @@ case "${1:-}" in
     [ "$code" = 0 ]
     ;;
 
+  diag)
+    # Why a VM did not become ready, for the results artifact. The serial
+    # port output (readable with serial-port-enable=FALSE, which only turns
+    # off the interactive console) has the boot and the startup script's
+    # output, also when SSH is what broke. Then the startup script's journal
+    # of the control VM over IAP, and of each node from the control VM.
+    # Best effort and bounded: never fails the job on its own.
+    : "${RESULTS:?}" "${RUN_ID:?}"
+    d="$RESULTS/diag"
+    mkdir -p "$d"
+    names=$(gcloud compute instances list --filter="labels.run_id=${RUN_ID}" \
+              --format='value(name,zone.basename())') || names=
+    while read -r name zone; do
+      [ -n "$name" ] || continue
+      timeout 120 gcloud compute instances get-serial-port-output "$name" --zone "$zone" \
+        > "$d/$name.serial.log" 2>&1 || echo "(serial output of $name: failed)"
+      echo "$name: $(grep -c . "$d/$name.serial.log") serial lines; startup script:"
+      grep -E 'startup-script|zcube-jepsen' "$d/$name.serial.log" | tail -n 15 || true
+    done <<<"$names"
+    if [ -n "${CONTROL:-}" ]; then
+      # shellcheck disable=SC2016 # expanded on the control VM
+      T=300 gssh 'sudo journalctl -u google-startup-scripts --no-pager > /tmp/zj-startup-control.log 2>&1
+        for n in n1 n2 n3 n4 n5; do
+          test -f ~/zj/key || break
+          timeout 30 ssh -i ~/zj/key -o BatchMode=yes -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR \
+            "root@$n" "journalctl -u google-startup-scripts -u ssh --no-pager" \
+            > "/tmp/zj-startup-$n.log" 2>&1 || echo "(root ssh to $n failed)" >> "/tmp/zj-startup-$n.log"
+        done
+        tar -czf /tmp/zj-diag.tar.gz -C /tmp $(cd /tmp && ls zj-startup-*.log)' \
+        && T=120 gscp "$CONTROL:/tmp/zj-diag.tar.gz" "$d/journals.tar.gz" \
+        && tar -xzf "$d/journals.tar.gz" -C "$d" && rm -f "$d/journals.tar.gz" \
+        || echo "(journals over IAP: failed)"
+    fi
+    ls -l "$d"
+    ;;
+
   *)
-    echo "usage: $0 wait-ssh | ship H B K | start TESTS LIMIT | wait | fetch" >&2
+    echo "usage: $0 wait-ssh | ship H B K | start TESTS LIMIT | wait | fetch | diag" >&2
     exit 2
     ;;
 esac

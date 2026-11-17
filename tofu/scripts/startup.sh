@@ -11,6 +11,9 @@
 # gets a JDK, Leiningen and graphviz. Both write /var/lib/zj-ready last,
 # which the workflow waits for.
 set -euo pipefail
+# The output goes to the journal (google-startup-scripts) and the serial
+# console, which the workflow collects when a VM never becomes ready.
+trap 'echo "zcube-jepsen: startup script failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 md() {
   curl -fsS --retry 5 -H 'Metadata-Flavor: Google' \
@@ -45,19 +48,37 @@ export DEBIAN_FRONTEND=noninteractive
 case "$role" in
   node)
     install -d -m 700 /root/.ssh
-    md zj-root-key > /root/.ssh/authorized_keys
+    # from=: the key works from the subnet only, whatever sshd's own config
+    # ends up saying.
+    printf 'from="%s" %s\n' "$subnet" "$(md zj-root-key)" > /root/.ssh/authorized_keys
     chmod 600 /root/.ssh/authorized_keys
-    # Root by key, from the subnet only (the control VM). Jepsen opens many
-    # sessions at once. Everything else stays as the image has it (OS Login).
-    cat > /etc/ssh/sshd_config.d/60-zcube-jepsen.conf <<CONF
+    # Root by key from the subnet (the control VM) only, never from IAP's
+    # range; everything else stays as the image has it (OS Login). Jepsen
+    # opens many sessions at once. 10-: sshd keeps the first value it reads,
+    # so these win over the image's own drop-ins (50-cloudimg-settings.conf);
+    # the Match block ends with this file.
+    cat > /etc/ssh/sshd_config.d/10-zcube-jepsen.conf <<CONF
 MaxSessions 100
 MaxStartups 100
 UseDNS no
+PermitRootLogin no
 Match Address $subnet
     PermitRootLogin prohibit-password
 CONF
-    sshd -t
-    systemctl reload ssh
+    # sshd -t needs /run/sshd, which on 24.04 only ssh.service creates
+    # (RuntimeDirectory=), and a host key, which cloud-init makes on first
+    # boot; a throwaway host key checks the config whatever the boot order.
+    install -d -m 0755 /run/sshd
+    hostkey=$(mktemp -d)
+    ssh-keygen -q -t ed25519 -N '' -f "$hostkey/k"
+    sshd -t -h "$hostkey/k"
+    rm -rf "$hostkey"
+    # 24.04 socket-activates sshd: ssh.socket starts ssh.service on the
+    # first connection, which then reads the config, drop-in included. If
+    # ssh.service already runs, reload it; if not, leave it alone (a plain
+    # reload fails on an inactive unit). ssh.socket listens on what
+    # Port/ListenAddress say, which this drop-in does not touch.
+    systemctl try-reload-or-restart ssh.service
 
     # The harness creates its own clusters; no default one on 5432.
     install -d /etc/postgresql-common/createcluster.d

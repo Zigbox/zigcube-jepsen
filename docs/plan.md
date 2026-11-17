@@ -340,10 +340,14 @@ Done on `claude/jepsen-5`: `docs/stale-put.md`.
 ## J3 slice 1: GCP VMs, OpenTofu, keyless CI (on `claude/j3-gcp`)
 
 `tofu/` creates a VPC, NAT, IAP-only SSH, five nodes and a control VM;
-`gcp.yml` applies it on a dispatch on main, runs the selected tests from
+`gcp.yml` checks the inputs, builds Zigcube in a job with no GCP access,
+applies it on a dispatch on main, runs the selected tests from
 the control VM, uploads the store, and destroys everything in a job that
 always runs; `gcp-sweeper.yml` deletes leftovers hourly. Decisions:
 `docs/decisions/2026-11-17-gcp-opentofu.md`; runbook: README "Running on
 GCP". Offline checks only so far (`tofu fmt`, `validate`, `test` with a
-mocked provider, shellcheck, actionlint, `lein test`): no live run yet.
+mocked provider, shellcheck, actionlint, `lein test`, the scripts'
+self-tests, the node startup script's sshd in an Ubuntu 24.04 container):
+no live run yet. Owner action pending: pin the WIF provider to the two
+workflow files (decision file, "Owner actions").
 Next: the first dispatch, then a schedule, then clock faults on real VMs.

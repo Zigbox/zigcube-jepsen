@@ -63,6 +63,18 @@ run "cluster" {
     condition     = google_compute_instance.node["n1"].scheduling[0].max_run_duration[0].seconds == 18000
     error_message = "GCE deletes the VMs after max_run_hours"
   }
+  assert {
+    condition     = google_compute_instance.control.scheduling[0].instance_termination_action == "DELETE" && google_compute_instance.control.scheduling[0].max_run_duration[0].seconds == 18000 && alltrue([for n in values(google_compute_instance.node) : n.scheduling[0].instance_termination_action == "DELETE"])
+    error_message = "every VM, control included, is deleted (not stopped) at max_run_duration"
+  }
+  assert {
+    condition     = google_compute_firewall.internal.source_ranges == toset(["10.78.0.0/24"])
+    error_message = "internal traffic from the subnet only"
+  }
+  assert {
+    condition     = google_compute_instance.control.metadata["block-project-ssh-keys"] == "TRUE" && alltrue([for n in values(google_compute_instance.node) : n.metadata["block-project-ssh-keys"] == "TRUE" && n.metadata["zj-subnet"] == "10.78.0.0/24"])
+    error_message = "project-wide SSH keys blocked on every VM; nodes know the subnet (root SSH only from it)"
+  }
 }
 
 run "bad_key" {

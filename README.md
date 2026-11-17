@@ -241,8 +241,10 @@ pull request and every push to `main` and the `claude/` branches, and uploads `s
 and Jepsen inside the VPC), all created by OpenTofu (`tofu/`) and destroyed
 again by the same workflow. Auth is Workload Identity Federation only, with
 no keys, and only from `main`, so pull requests get offline checks (`tofu fmt`,
-`validate`, `test`, shellcheck, actionlint) and live runs are dispatched on
-`main`. Why each part is as it is:
+`validate`, `test`, shellcheck, actionlint, the scripts' self-tests, the
+nodes' sshd setup in an Ubuntu 24.04 container) and live runs are
+dispatched on `main`. Zigcube is built in a job that cannot get a GCP token;
+only the jobs that create and destroy the cluster can. Why each part is as it is:
 `docs/decisions/2026-11-17-gcp-opentofu.md`.
 
 **Dispatch a run** (needs write access to the repository):
@@ -264,7 +266,13 @@ another on the same cluster: `api-` and `pg-` with `fenced`, `unfenced`,
 `stale-put-idle`), `time_limit` (seconds of load per register test, 30 to
 1800; the lease tests take at least their `jepsen.yml` limits, 200 and 120).
 Each test gets the same arguments as its `jepsen.yml` / `stale-put.yml` job.
-Runs queue: one at a time.
+The `check the inputs` job refuses unknown tests, malformed values, and a
+selection that would not fit in the live job's 150 minutes (about 20 min of
+setup, then each test's load plus 5 min).
+One run at a time, and at most one waiting: a dispatch made while another
+run is waiting replaces it (GitHub cancels the waiting one, never the one
+running), so dispatch the next run once the previous one has started, or
+put all its tests in one run.
 
 **Read the results.** The run summary has a table: test, exit code,
 seconds, store directory. The step log shows each test's nemesis trace and
@@ -272,7 +280,9 @@ verdict. The artifact `jepsen-gcp-<run id>` holds `out/summary.tsv`,
 `out/run.log` (the control VM's log), `out/logs/<test>.log` (each test's
 full output) and `harness/store/` (Jepsen's store: `results.edn`,
 `history.edn`, `jepsen.log`, the node logs), which `lein run serve` browses
-after unpacking.
+after unpacking. A failed run also has `diag/`: each VM's serial port
+output (`<vm>.serial.log`, the startup script's progress and errors) and,
+if the control VM was reachable, the startup and sshd journals of every VM.
 
 **Cost.** About $0.75 an hour while the cluster is up (on-demand
 us-central1: 5 x e2-standard-4 about $0.67, e2-standard-2 about $0.07, six
@@ -280,9 +290,17 @@ us-central1: 5 x e2-standard-4 about $0.67, e2-standard-2 about $0.07, six
 processing for apt and Maven (well under $0.10). The default four tests take
 about 40 to 60 minutes including setup: roughly $0.50 to $1 per run.
 
-**Tearing down by hand** (if CI died before its `tofu destroy` job). With
-application-default credentials (`gcloud auth application-default login`,
-not a key) of someone allowed to delete compute resources in the project:
+**If the `tofu destroy` job failed**, re-run that job alone: open the run,
+click the `tofu destroy` job, and use **Re-run job** there (same state
+prefix). Not **Re-run failed jobs** on the run: that also re-runs a failed
+`run on GCP`, which creates a new cluster. The job removes a state lock left
+by a cancelled apply (only this run's own), destroys, then deletes whatever
+of this run is still in the project, by its `run_id` label and network
+name.
+
+**Tearing down by hand** (if CI cannot). With application-default
+credentials (`gcloud auth application-default login`, not a key) of someone
+allowed to delete compute resources in the project:
 
 ```sh
 cd tofu
@@ -290,14 +308,49 @@ tofu init -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="prefix=runs
 TF_VAR_project_id=$GCP_PROJECT_ID TF_VAR_zone=$GCP_ZONE TF_VAR_region=us-central1 \
 TF_VAR_run_id=<github run id> TF_VAR_root_ssh_public_key='ssh-ed25519 destroy' \
   tofu destroy
+# "Error acquiring the state lock": only if no run is going, with the lock
+# ID tofu printed:  tofu force-unlock <ID>
+cd ..
+# Whatever of that run is left, whatever its age (DRY_RUN=1 lists only):
+RUN_ID=<github run id> PROJECT=$GCP_PROJECT_ID gcp/sweep.sh
 ```
 
-Or re-run the failed `tofu destroy` job of that run from the Actions page
-(same state prefix). Failing both, the hourly `gcp-sweeper.yml` deletes
-every `purpose=jepsen` instance and `zj-*` network older than 4 hours
-(dispatch it with `max_age_hours=0` to sweep now, `dry_run=true` to list),
-and GCE itself deletes each VM after 5 hours (`max_run_hours`). A red
-sweeper run means it found something: some teardown failed.
+Failing all of that, the hourly `gcp-sweeper.yml` deletes every
+`purpose=jepsen` instance and `zj-*` network older than 4 hours (dispatch it
+with `dry_run=true` to list; `max_age_hours` is at least 3, so it never
+touches a run that is still going), and GCE itself deletes each VM after 5
+hours (`max_run_hours`). A red sweeper run means it found something: some
+teardown failed.
+
+**Optional hardening (owner, GCP side).** Pin the WIF provider to the two
+workflow files that need a token, so no other workflow on main can get one:
+the exact `gcloud` command is in
+`docs/decisions/2026-11-17-gcp-opentofu.md`, "Owner actions". If the project
+is in an organization, these organization policies fit what the workflows
+do (they need Organization Policy Administrator on the project, and
+`orgpolicy.googleapis.com` enabled; check what is set first with
+`gcloud org-policies list --project=$GCP_PROJECT_ID`):
+
+```sh
+for c in compute.vmExternalIpAccess:deny iam.disableServiceAccountKeyCreation:enforce \
+         compute.skipDefaultNetworkCreation:enforce compute.requireOsLogin:enforce; do
+  name=${c%%:*}
+  if [ "${c#*:}" = deny ]; then
+    rule='  - denyAll: true'          # list constraint: no VM may have an external IP
+  else
+    rule='  - enforce: true'          # boolean constraint
+  fi
+  printf 'name: projects/%s/policies/%s\nspec:\n  rules:\n%s\n' \
+    "$GCP_PROJECT_ID" "$name" "$rule" > "/tmp/$name.yaml"
+  gcloud org-policies set-policy "/tmp/$name.yaml"
+done
+```
+
+`vmExternalIpAccess` makes an external IP impossible rather than merely
+absent from `tofu/`; `disableServiceAccountKeyCreation` keeps decision 2
+(no keys) true by construction; `requireOsLogin` matches the VMs'
+`enable-oslogin`. A log-based alert on any firewall rule with source
+`0.0.0.0/0` in the project is a cheap extra.
 
 ## Fault primitives in containers
 

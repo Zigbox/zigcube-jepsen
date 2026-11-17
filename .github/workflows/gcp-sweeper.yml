@@ -5,6 +5,11 @@ name: gcp-sweeper
 # and subnets) older than max_age_hours. Fails if it found anything, so a
 # broken teardown shows up as a red run. Same keyless auth as gcp.yml; the
 # WIF provider admits main only, and schedules run on the default branch.
+#
+# max_age_hours is at least 3 (sweep.sh refuses less): a run of gcp.yml
+# holds nothing older, so this never deletes a cluster under a live run. To
+# clean up one run now, re-run that run's `tofu destroy` job: it destroys
+# and then sweeps that run only, whatever its age.
 
 on:
   schedule:
@@ -12,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       max_age_hours:
-        description: Delete what is older than this many hours
+        description: Delete what is older than this many hours (at least 3)
         default: "4"
       dry_run:
         description: List only
@@ -21,10 +26,11 @@ on:
   pull_request:
     paths:
       - gcp/sweep.sh
+      - gcp/tests/**
       - .github/workflows/gcp-sweeper.yml
 
-permissions:
-  contents: read
+# Nothing by default; each job asks for what it needs.
+permissions: {}
 
 concurrency:
   group: gcp-sweeper-${{ github.event_name == 'pull_request' && github.ref || 'live' }}
@@ -45,6 +51,8 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -61,6 +69,12 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: shellcheck gcp/sweep.sh
+        with:
+          persist-credentials: false
+      - run: shellcheck gcp/sweep.sh gcp/tests/sweep-test.sh
+      - name: sweep.sh against a stub gcloud
+        run: bash gcp/tests/sweep-test.sh
