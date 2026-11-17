@@ -284,7 +284,7 @@ after unpacking. A failed run also has `diag/`: each VM's serial port
 output (`<vm>.serial.log`, the startup script's progress and errors) and,
 if the control VM was reachable, the startup and sshd journals of every VM.
 
-**Cost.** About $0.75 an hour while the cluster is up (on-demand
+**Cost.** About $0.50 an hour while the cluster is up (on-demand
 us-central1: 5 x e2-standard-2 about $0.35, e2-standard-2 about $0.07, six
 20 GB balanced disks and the NAT gateway a few cents), plus NAT data
 processing for apt and Maven (well under $0.10). The default four tests take
