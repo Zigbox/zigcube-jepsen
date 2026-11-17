@@ -232,7 +232,125 @@ CI: `.github/workflows/jepsen.yml` runs each register workload in each mode
 (eight jobs) and the lease test in three modes (valid and wedged at `fb385b2`, late-kill:
 the valid schedule at `f7736a7`, expected to break I1b) on `ubuntu-24.04` for every
 pull request and every push to `main` and the `claude/` branches, and uploads `store/` as artifacts
-`jepsen-store-<workload>-<mode>`.
+`jepsen-store-<workload>-<mode>`. On GCP VMs: [Running on GCP](#running-on-gcp).
+
+## Running on GCP
+
+`.github/workflows/gcp.yml` runs the same tests on six GCP VMs (five nodes
+`n1`..`n5`, `e2-standard-4`, and a control VM, `e2-standard-2`, that runs lein
+and Jepsen inside the VPC), all created by OpenTofu (`tofu/`) and destroyed
+again by the same workflow. Auth is Workload Identity Federation only, with
+no keys, and only from `main`, so pull requests get offline checks (`tofu fmt`,
+`validate`, `test`, shellcheck, actionlint, the scripts' self-tests, the
+nodes' sshd setup in an Ubuntu 24.04 container) and live runs are
+dispatched on `main`. Zigcube is built in a job that cannot get a GCP token;
+only the jobs that create and destroy the cluster can. Why each part is as it is:
+`docs/decisions/2026-11-17-gcp-opentofu.md`.
+
+**Dispatch a run** (needs write access to the repository):
+
+```sh
+gh workflow run gcp.yml --repo Zigbox/zigcube-jepsen --ref main \
+  -f zigcube_ref=fb385b2d0d7e6beefd3225e71ae2bcf3437aa474 \
+  -f tests="api-fenced pg-fenced lease-valid lease-wedged" \
+  -f time_limit=120
+gh run watch --repo Zigbox/zigcube-jepsen "$(gh run list --repo Zigbox/zigcube-jepsen --workflow gcp.yml --limit 1 --json databaseId -q '.[0].databaseId')"
+```
+
+Inputs: `zigcube_ref` (any commit, branch or tag of Zigbox/zigcube; the
+lease tests' own pins are `fb385b2` for `lease-valid`/`lease-wedged` and
+`f7736a7` for `lease-late-kill`), `tests` (space-separated, run one after
+another on the same cluster: `api-` and `pg-` with `fenced`, `unfenced`,
+`negative-control`, `unfenced-async`; `lease-valid`, `lease-wedged`,
+`lease-late-kill`; `stale-put-running`, `stale-put-registered`,
+`stale-put-idle`), `time_limit` (seconds of load per register test, 30 to
+1800; the lease tests take at least their `jepsen.yml` limits, 200 and 120).
+Each test gets the same arguments as its `jepsen.yml` / `stale-put.yml` job.
+The `check the inputs` job refuses unknown tests, malformed values, and a
+selection that would not fit in the live job's 150 minutes (about 20 min of
+setup, then each test's load plus 5 min).
+One run at a time, and at most one waiting: a dispatch made while another
+run is waiting replaces it (GitHub cancels the waiting one, never the one
+running), so dispatch the next run once the previous one has started, or
+put all its tests in one run.
+
+**Read the results.** The run summary has a table: test, exit code,
+seconds, store directory. The step log shows each test's nemesis trace and
+verdict. The artifact `jepsen-gcp-<run id>` holds `out/summary.tsv`,
+`out/run.log` (the control VM's log), `out/logs/<test>.log` (each test's
+full output) and `harness/store/` (Jepsen's store: `results.edn`,
+`history.edn`, `jepsen.log`, the node logs), which `lein run serve` browses
+after unpacking. A failed run also has `diag/`: each VM's serial port
+output (`<vm>.serial.log`, the startup script's progress and errors) and,
+if the control VM was reachable, the startup and sshd journals of every VM.
+
+**Cost.** About $0.75 an hour while the cluster is up (on-demand
+us-central1: 5 x e2-standard-4 about $0.67, e2-standard-2 about $0.07, six
+20 GB balanced disks and the NAT gateway a few cents), plus NAT data
+processing for apt and Maven (well under $0.10). The default four tests take
+about 40 to 60 minutes including setup: roughly $0.50 to $1 per run.
+
+**If the `tofu destroy` job failed**, re-run that job alone: open the run,
+click the `tofu destroy` job, and use **Re-run job** there (same state
+prefix). Not **Re-run failed jobs** on the run: that also re-runs a failed
+`run on GCP`, which creates a new cluster. The job removes a state lock left
+by a cancelled apply (only this run's own), destroys, then deletes whatever
+of this run is still in the project, by its `run_id` label and network
+name.
+
+**Tearing down by hand** (if CI cannot). With application-default
+credentials (`gcloud auth application-default login`, not a key) of someone
+allowed to delete compute resources in the project:
+
+```sh
+cd tofu
+tofu init -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="prefix=runs/<github run id>"
+TF_VAR_project_id=$GCP_PROJECT_ID TF_VAR_zone=$GCP_ZONE TF_VAR_region=us-central1 \
+TF_VAR_run_id=<github run id> TF_VAR_root_ssh_public_key='ssh-ed25519 destroy' \
+  tofu destroy
+# "Error acquiring the state lock": only if no run is going, with the lock
+# ID tofu printed:  tofu force-unlock <ID>
+cd ..
+# Whatever of that run is left, whatever its age (DRY_RUN=1 lists only):
+RUN_ID=<github run id> PROJECT=$GCP_PROJECT_ID gcp/sweep.sh
+```
+
+Failing all of that, the hourly `gcp-sweeper.yml` deletes every
+`purpose=jepsen` instance and `zj-*` network older than 4 hours (dispatch it
+with `dry_run=true` to list; `max_age_hours` is at least 3, so it never
+touches a run that is still going), and GCE itself deletes each VM after 5
+hours (`max_run_hours`). A red sweeper run means it found something: some
+teardown failed.
+
+**Optional hardening (owner, GCP side).** Pin the WIF provider to the two
+workflow files that need a token, so no other workflow on main can get one:
+the exact `gcloud` command is in
+`docs/decisions/2026-11-17-gcp-opentofu.md`, "Owner actions". If the project
+is in an organization, these organization policies fit what the workflows
+do (they need Organization Policy Administrator on the project, and
+`orgpolicy.googleapis.com` enabled; check what is set first with
+`gcloud org-policies list --project=$GCP_PROJECT_ID`):
+
+```sh
+for c in compute.vmExternalIpAccess:deny iam.disableServiceAccountKeyCreation:enforce \
+         compute.skipDefaultNetworkCreation:enforce compute.requireOsLogin:enforce; do
+  name=${c%%:*}
+  if [ "${c#*:}" = deny ]; then
+    rule='  - denyAll: true'          # list constraint: no VM may have an external IP
+  else
+    rule='  - enforce: true'          # boolean constraint
+  fi
+  printf 'name: projects/%s/policies/%s\nspec:\n  rules:\n%s\n' \
+    "$GCP_PROJECT_ID" "$name" "$rule" > "/tmp/$name.yaml"
+  gcloud org-policies set-policy "/tmp/$name.yaml"
+done
+```
+
+`vmExternalIpAccess` makes an external IP impossible rather than merely
+absent from `tofu/`; `disableServiceAccountKeyCreation` keeps decision 2
+(no keys) true by construction; `requireOsLogin` matches the VMs'
+`enable-oslogin`. A log-based alert on any firewall rule with source
+`0.0.0.0/0` in the project is a cheap extra.
 
 ## Fault primitives in containers
 
@@ -294,6 +412,8 @@ src/zcube_jepsen/lease.clj      lease workload: recorder, watch, faults, collect
 src/zcube_jepsen/lease_checkers.clj  fencing, I1a, I1b, lease verdict
 test/                           checker unit tests
 docker/                         node image, up/down, fault probe
+tofu/                           the GCP cluster (OpenTofu): VPC, NAT, IAP SSH, VMs
+gcp/                            CI side of a GCP run, the control VM's runner, sweeper
 docs/plan.md                    slices: what is done and what is next
 ```
 
