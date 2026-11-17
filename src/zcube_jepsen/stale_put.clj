@@ -159,10 +159,11 @@
   (c/su (c/exec :bash :-c (str "kill -9 $(cat " zcube/agent-pid ")"))))
 
 (defn control-ip
-  "The control host as the node sees it: the node's default gateway."
+  "The control host as the node sees it: where this SSH session comes from
+  ($SSH_CLIENT). In Docker that is the bridge's gateway, the host; on GCP it
+  is the control VM's address in the subnet, not the gateway."
   []
-  (str/trim (c/exec :bash :-c
-                    "ip -4 route show default | awk '{print $3; exit}'")))
+  (cn/control-ip))
 
 ;; ---------------------------------------------------------------- the server
 
