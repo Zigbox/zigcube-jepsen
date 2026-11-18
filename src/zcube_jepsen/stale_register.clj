@@ -366,7 +366,7 @@
    [nil "--zcube-images FILE" "The fake runtime's image list."
     :default "zigcube/fixtures/images.zon"]
    [nil "--lease-ttl-ms N" "zcube-server's --lease-ttl-ms."
-    :default 20000 :parse-fn parse-long]
+    :default 10000 :parse-fn parse-long]
    [nil "--replication MODE" "The Postgres pair: sync (the supported setup)."
     :default :sync :parse-fn keyword]
    [nil "--zcube-tls MODE"

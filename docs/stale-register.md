@@ -74,7 +74,7 @@ The test has three outcomes:
   - The released transaction ran after L1 may have ended. Such a PUT is
     refused for a reason that is not #237's. L1 lives until at least the
     second agent start plus the ttl. `done`'s `at_ms` must come at least
-    1 s before that (`clock-margin-ms`). The default ttl is 20 s.
+    1 s before that (`clock-margin-ms`). The default ttl is 10 s.
 
 Any other result is `:unexpected` and fails.
 
@@ -132,7 +132,7 @@ lein run -m zcube-jepsen.stale-register test --ssh-private-key docker/.ssh/id_ed
   --zcube-bin /tmp/sr/bin --zcube-images <zigcube>/fixtures/images.zon --label candidate
 ```
 
-The options are `--lease-ttl-ms` (default 20000), `--replication`,
+The options are `--lease-ttl-ms` (default 10000; the server refuses more with ZC-E0121, as its fence margin could not cover it), `--replication`,
 `--zcube-tls auto|on|off` and `--label`.
 
 On GCP:
