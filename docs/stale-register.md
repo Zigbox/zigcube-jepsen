@@ -4,7 +4,8 @@
 registration (Zigbox/zigcube#281, decision
 `docs/decisions/2026-11-18-registration-lease-order.md` there). A
 `PUT /v1/agent/nodes/<node>` carries a lease. If that lease is older than the
-one `/nodes/<node>` already holds, the server must refuse it (503 ZC-E0205).
+one `/nodes/<node>` already holds, the server must refuse it (503 ZC-E0205;
+the test sees the 503, not the code, see "Checks").
 The test runs this against the real server, over its mTLS `--listen`. No
 proxy sits between the agent and the server, and the test does not use
 stale-put's plain-HTTP hold proxy (`docs/stale-put.md`). stale-put is
@@ -51,58 +52,98 @@ test calls it n1. The steps:
    `/nodes/n4` is on L2 (L2 > L1) and ready. (Removing the file stands for an
    agent that lost its state, the one way to get a second grant while L1
    lives.)
-5. Write `release-n4-L1`, then wait for `done-n4-L1`.
+5. Write `release-n4-L1`, then wait for `done-n4-L1`. Right after it
+   appears, read L1's and L2's rows from the store's lease table
+   (`zcube.store_lease`, via psql).
 6. Read `GET /v1/nodes?at=N`. N is the revision the released PUT wrote if it
    succeeded. Otherwise N is the server's revision read right after `done`.
-7. Read the store's log (`zcube.store_log`, via psql) to check I2.
+7. Watch `/nodes/n4` every 500 ms for the ttl + the lost grace + 5 s, and
+   keep each change (`:observe-after`; about 16 s at the default ttl).
+8. Read the store's log (`zcube.store_log`, via psql) to check I2, and the
+   server log's lines for `PUT /v1/agent/nodes/n4`.
 
 Every wait has a deadline. A step that runs out of time or throws makes the
 run vacuous.
 
 ## Checks (`judge`, unit-tested in `stale_register_test.clj`)
 
-The test has three outcomes:
+Each verdict is proved from evidence. A missing file, a timeout, or a hold
+that was never reached never reads as a refusal.
 
-- **`:refused`** (passes). All of these hold:
-  - `done` says `succeeded 0`.
-  - At N, `/nodes/n4` is on L2 at L2's own tenure (mod_revision).
-  - The store has no put of `/nodes/n4` on a lease lower than an earlier
-    put's (I2, `stale-put/stale-registrations`).
-- **`:stale-registration-landed`** (fails, and says why). Any of these:
-  - The release succeeded.
-  - `/nodes/n4` is back on L1.
-  - The store has a stale put.
-- **`:vacuous`** (fails). Any of these:
-  - A step did not happen as planned.
-  - L2 is not newer than L1.
-  - The read failed or was truncated.
-  - The store was not read.
-  - The released transaction ran after L1 may have ended. Such a PUT is
-    refused for a reason that is not #237's. L1 lives until at least the
-    second agent start plus the ttl. `done`'s `at_ms` must come at least
-    1 s before that (`clock-margin-ms`). The default ttl is 10 s.
+**`:vacuous`**: the run did not set up #237's race. Any of these:
 
-Any other result is `:unexpected` and fails.
+- A step ran out of time or threw.
+- The run did not use mTLS (the test forces `:zcube-tls-mode :on`).
+- `held-n4-L1` was never written, so the hold was not reached.
+- Not L0 < L1 < L2, or L2's tenure (its registration's mod_revision) is
+  unknown.
+- There was no release, or no `done` with its succeeded flag, or `done`
+  came before the release (less 1 s of clock margin).
+- `done` says `succeeded 1` at a revision not above L2's tenure (an in-order
+  write, not a stale one).
+- `done` came less than 1 s (`clock-margin-ms`) before L1's earliest end:
+  the second agent start plus the ttl. The default ttl is 10 s.
+- L1 or L2 was not live in the store's lease table right after `done`. A
+  lease id is never reused, and its row goes when the lease ends, so a row
+  live after `done` was live while the PUT ran.
+- The read at N failed or was truncated, or the store's log was not read.
 
-The summary goes to `store/<test>/<time>/stale-register.edn`.
+**Finding (a)**, whether the held PUT landed:
+
+- `:landed`: `done` says `succeeded 1`, and the store has a put of
+  `/nodes/n4` on L1 at `done`'s revision.
+- `:refused`: `done` says `succeeded 0`; the server log has the held PUT's
+  line with status 503 (the first `PUT /v1/agent/nodes/n4` logged within 5 s
+  after `done`, which took at least as long as the hold); and the store has
+  no put of `/nodes/n4` on L1 after L2's tenure.
+- `:unknown`: anything else, for example no log line, another status, or a
+  store that disagrees with `done`.
+
+The barrier records only whether the answer was 200, and the request log
+only the status. So ZC-E0205 itself is not observed. A 503 with both leases
+live and the key still on L2 is what #281's lease order gives. A 503 for
+another reason at that moment (an unavailable store) would also read as
+`:refused`.
+
+**Finding (b)**, the state: `/nodes/n4` at N (on L1 at `done`'s revision,
+on L2 at its tenure, absent, or other), and its changes after
+(`:observe-after`).
+
+**Outcome**:
+
+- `:stale-registration-landed`: (a) is `:landed` and `/nodes/n4` is on L1
+  at N.
+- `:refused`: (a) is `:refused`, `/nodes/n4` is on L2 at its tenure at N,
+  and the store has no put of `/nodes/n4` on a lease lower than an earlier
+  put's (I2, `stale-put/stale-registrations`).
+- `:vacuous` or `:unknown` as above.
+- `:unexpected`: anything else.
+
+`--expect` names the one outcome that passes: `refused` (the default) or
+`stale-registration-landed`. Every other outcome fails. The summary goes to
+`store/<test>/<time>/stale-register.edn`.
 
 ## The two runs
 
 | test | server | agent | must |
 |---|---|---|---|
-| `stale-register-candidate` | Zigcube 7d141a7 (#281 merged), barrier built in | 190f8dc (0.5.2), which sends no `replaces` | pass (`:refused`) |
-| `stale-register-control` | 190f8dc with the barrier patched in | 190f8dc | fail (`:stale-registration-landed`) |
+| `stale-register-candidate` | Zigcube 7d141a7 (#281 merged), barrier built in | 190f8dc (0.5.2), which sends no `replaces` | `:refused` (`--expect refused`) |
+| `stale-register-control` | 190f8dc with the barrier patched in | 190f8dc | `:stale-registration-landed` (`--expect stale-registration-landed`) |
 
 The control is a known-bad build. It shows that the barrier really reaches
-the code path and that the checker sees a stale registration land. So its
-run is red by design, and the GCP run as a whole exits 1. Read each test's
-row in the summary table on its own.
+the code path and that the checker sees a stale registration land. It is
+run with `--expect stale-registration-landed`, so it exits 0 when the
+landing is proved. It fails if it is refused, vacuous, or unknown. So the
+GCP job is green only if both tests showed their expected outcome, and the
+summary table's `outcome` column says which outcome each test had.
 
 The control's patch is `gcp/patches/register-barrier-190f8dc.patch`.
-- What it is: `git diff 190f8dc 7d141a7` for `src/server.zig`,
-  `src/server_http.zig`, `src/zcube_server.zig` and
-  `src/server_register_barrier.zig` (the hook and its wiring), plus the
-  `register-barrier` build option in `build.zig`.
+- What it is: the whole of `git diff 190f8dc 7d141a7` for
+  `src/server.zig`, `src/server_http.zig`, `src/zcube_server.zig` and
+  `src/server_register_barrier.zig` (the hook and its wiring): after the
+  patch those four files are byte-identical to 7d141a7. From `build.zig` it
+  takes only the hunks for the `register-barrier` option; the rest of that
+  file's diff is left out.
 - What it leaves out: #281's change to `agent_api.zig`, and the barrier's
   unit test.
 - Where it applies: cleanly on 190f8dc.
@@ -123,9 +164,16 @@ normal build. This happens only when a `stale-register-*` test is asked for:
 - **Packing.** Both go into the bundle under
   `stale-register/{candidate,control}/` (`bin/`, `images.zon`, `COMMIT`),
   apart from `bin/` and `dist/`.
-- **Checks.** The job fails if either barrier server lacks the string
-  `ZCUBE_TEST_REGISTER_BARRIER`. It also fails if the normal `bin/` server
-  or anything in a `dist/` tarball has it.
+- **Checks.** Before the candidate build, the job checks that `zig build -h`
+  at `zigcube_ref` lists `-Dregister-barrier` (it needs #281), and fails
+  otherwise. After the builds, it fails if either barrier server lacks the
+  string `ZCUBE_TEST_REGISTER_BARRIER`. It also fails if the normal `bin/`
+  server or anything in `dist/` has it: every archive in `dist/` is unpacked
+  and scanned, an archive that will not unpack fails the job, and so does a
+  `dist/` with no archive in it.
+- **Inputs.** `gcp/check-inputs.sh` requires `zigcube_ref` to be a full
+  40-hex commit when a `stale-register-*` test is asked for, so the
+  candidate's commit is fixed.
 
 ## How to run it
 
@@ -135,11 +183,17 @@ from a Zigcube checkout:
 ```
 zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dregister-barrier=true -p /tmp/sr
 lein run -m zcube-jepsen.stale-register test --ssh-private-key docker/.ssh/id_ed25519 \
-  --zcube-bin /tmp/sr/bin --zcube-images <zigcube>/fixtures/images.zon --label candidate
+  --zcube-bin /tmp/sr/bin --zcube-images <zigcube>/fixtures/images.zon \
+  --label candidate --expect refused
 ```
 
-The options are `--lease-ttl-ms` (default 10000; the server refuses more with ZC-E0121, as its fence margin could not cover it), `--replication`,
-`--zcube-tls auto|on|off` and `--label`.
+For the control, use its build and `--label control --expect
+stale-registration-landed`.
+
+The options are `--lease-ttl-ms` (default 10000; the server refuses more
+with ZC-E0121, as its fence margin could not cover it), `--replication`,
+`--label` and `--expect refused|stale-registration-landed` (default
+`refused`). mTLS is always on; there is no `--zcube-tls` option.
 
 On GCP:
 
