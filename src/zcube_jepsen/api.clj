@@ -33,12 +33,17 @@
 
 (defn svc-name [k] (str "r" k "x"))
 
-(defn http-client ^HttpClient []
-  (-> (HttpClient/newBuilder)
-      (.version HttpClient$Version/HTTP_1_1)
-      (.proxy HttpClient$Builder/NO_PROXY)
-      (.connectTimeout (Duration/ofSeconds 3))
-      (.build)))
+(defn http-client
+  "A client for zcube-server's API: mTLS with the admin certificate when the
+  server speaks it (zcube/tls), plain HTTP otherwise."
+  ^HttpClient [test]
+  (let [{:keys [tls? ssl-context]} (zcube/tls test)]
+    (-> (HttpClient/newBuilder)
+        (.version HttpClient$Version/HTTP_1_1)
+        (.proxy HttpClient$Builder/NO_PROXY)
+        (.connectTimeout (Duration/ofSeconds 3))
+        (cond-> tls? (.sslContext ssl-context))
+        (.build))))
 
 (defn request
   "Returns {:status n :body parsed-json-or-nil}."
@@ -69,8 +74,8 @@
   client/Client
   (open! [this test node]
     (assoc this
-           :http (http-client)
-           :base (str "http://" (zcube/server-node test) ":" zcube/port)))
+           :http (http-client test)
+           :base (zcube/base-url test)))
 
   (setup! [this test])
 

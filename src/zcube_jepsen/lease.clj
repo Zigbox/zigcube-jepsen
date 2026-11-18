@@ -124,8 +124,8 @@
 (defrecord Client [http base]
   client/Client
   (open! [this test node]
-    (assoc this :http (api/http-client)
-           :base (str "http://" (zcube/server-node test) ":" zcube/port)))
+    (assoc this :http (api/http-client test)
+           :base (zcube/base-url test)))
   (setup! [this test])
   (invoke! [this test op]
     (try
@@ -176,8 +176,8 @@
   Returns the watch's state, an atom of {:events [...] :from n :gaps [...]
   :errors n :running? bool}."
   [test]
-  (let [http  (api/http-client)
-        base  (str "http://" (zcube/server-node test) ":" zcube/port)
+  (let [http  (api/http-client test)
+        base  (zcube/base-url test)
         st    (atom {:events [] :from 1 :gaps [] :errors 0 :running? true
                      :last-error nil})
         url   (fn [from] (str base "/v1/watch?prefix=/assigned/&prefix=/replicas/"
@@ -223,8 +223,8 @@
 (defn finish-watch!
   "Lets the watch catch up with the store's head, then stops it."
   [test st]
-  (let [http (api/http-client)
-        base (str "http://" (zcube/server-node test) ":" zcube/port)
+  (let [http (api/http-client test)
+        base (zcube/base-url test)
         head (util/await-fn
                (fn [] (let [r (get-json http (str base "/v1/status") 10)]
                         (or (some-> r :body :store :revision)

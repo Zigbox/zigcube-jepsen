@@ -130,6 +130,7 @@
     (merge tests/noop-test
            opts
            {:name      (:name wl)
+            :zcube-tls (zcube/tls-state)
             :os        os/noop
             :db        ((:db wl))
             :client    (retrying ((:client wl)) final?)
@@ -247,6 +248,7 @@
            opts
            {:name      (str "zcube-lease-" (name (:expect opts))
                              (some->> (:lease-faults opts) name (str "-")))
+            :zcube-tls (zcube/tls-state)
             :os        os/noop
             :db        (lease/db)
             :client    (lease/client)

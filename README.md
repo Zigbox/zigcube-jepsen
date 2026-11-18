@@ -374,6 +374,43 @@ fake `CLOCK_MONOTONIC` unless asked, and Postgres run under it is untested
 here. If libfaketime cannot reach the Zigcube binaries, the fallbacks are a
 clock-offset test hook in the binaries, or KVM guests with their own clocks.
 
+## mTLS (Zigcube B7 and later)
+
+From B7, `zcube-server --listen` serves only TLS 1.3 and requires a client
+certificate (Zigcube `docs/mtls.md`). The harness detects which kind of server
+it has: the binary is mTLS-capable if `zcube-server --help` lists
+`ca issue-client`. Older pins (`fb385b2`, `f7736a7`) keep plain HTTP. The
+harness never uses `--insecure-listen`.
+
+With mTLS, `zcube.clj` does the following:
+
+- Starts the server with `--tls-name zcube-server --tls-san <server IP>`.
+- Issues certificates on the server node once the store and the CA exist:
+  `ca issue-client jepsen --scope admin` for the harness, and
+  `ca issue-node <n>` for each agent node. They go to `/var/lib/zcube/tls`,
+  which is 0700 with keys at 0600.
+- Copies the CA certificate, the admin certificate and key, and each node's
+  certificate and key to a 0700 temporary directory on the control node,
+  with keys and certificates at 0600. It deletes that directory at teardown.
+- Uploads each agent node's certificate and key to that node. The agent runs
+  with `--ca --cert --key --tls-name`.
+
+Keys are only ever passed as file paths. They are never printed and never put
+on a command line.
+
+Every client verifies the server against the CA and checks that its
+certificate names `zcube-server`. That name is the only DNS SAN on the
+server's Ed25519 certificate, while the clients dial an IP address:
+
+- `await-server!`'s curl uses `--resolve zcube-server:7070:<IP>`.
+- The JDK client (api, lease) wraps the PKIX trust manager in a check of the
+  SAN, as Zigcube's `ops/mtls-interop` client does.
+
+**stale-put needs plain HTTP.** Its hold proxy reads and holds the agent's
+plain-HTTP PUT, so it cannot sit inside mTLS. Against a B7+ server,
+stale-put fails at setup with a message that says so. It still runs at its
+own pinned (pre-B7) commit.
+
 ## What is not covered yet
 
 - **No compare-and-set through the API**, because the API has none. A plain
