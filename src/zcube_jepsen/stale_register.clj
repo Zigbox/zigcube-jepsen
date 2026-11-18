@@ -148,9 +148,14 @@
 (defn- barrier-files [test]
   (str/split-lines (on-server test #(c/exec :ls :-1 barrier-dir))))
 
-(defn- read-barrier-file [test file]
-  (on-server test #(c/exec :bash :-c
-                           (str "cat " barrier-dir "/" file " 2>/dev/null || true"))))
+(defn- read-barrier-file
+  "The file's bytes, \"\" when absent. A `|` is printed after them and taken
+  off here, since c/exec trims the trailing newline that parse-done needs to
+  see the line is complete."
+  [test file]
+  (let [out (on-server test #(c/exec :bash :-c
+                                     (str "cat " barrier-dir "/" file " 2>/dev/null; echo '|'")))]
+    (cond-> out (str/ends-with? out "|") (subs 0 (dec (count out))))))
 
 ;; ---------------------------------------------------------------- nemesis
 
