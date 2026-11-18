@@ -5,8 +5,14 @@
 #
 #   run.log        this script's own log
 #   logs/<t>.log   each test's stdout and stderr
-#   summary.tsv    test, exit code, seconds, store directory
+#   summary.tsv    test, exit code, outcome, seconds, store directory
 #   exit           0 if every test passed, else 1 (written last)
+#
+# A test passes when it exits 0: its outcome is the one it expects. The
+# known-bad controls (negative-control, stale-register-control, ...) pass
+# --expect with the failure they must show, so they exit 0 when they show it
+# and 1 on anything else, a vacuous run included. "outcome" is the test's
+# own verdict where it writes one (stale-register.edn's :outcome), else -.
 #
 # Usage: control-run.sh "<test> <test> ..." <time-limit-seconds>
 # Tests: api-fenced api-unfenced api-negative-control api-unfenced-async,
@@ -69,12 +75,15 @@ args_for() {
     stale-put-idle)
       echo run -m zcube-jepsen.stale-put test "${common[@]}" --expect auto --release-after registered --services 0 ;;
     # The barrier servers gcp.yml's build job made from source (never the
-    # dist build); the control is meant to fail.
+    # dist build). Over mTLS always (the test forces it). The control is
+    # 0.5.2, a known-bad control: it passes only when the stale
+    # registration lands, the candidate only when it is refused.
     stale-register-candidate|stale-register-control)
-      local v=${t#stale-register-}
+      local v=${t#stale-register-} e=refused
+      [ "$v" = control ] && e=stale-registration-landed
       echo run -m zcube-jepsen.stale-register test --ssh-private-key "$key" \
         --zcube-bin "$zc/stale-register/$v/bin" \
-        --zcube-images "$zc/stale-register/$v/images.zon" --label "$v" ;;
+        --zcube-images "$zc/stale-register/$v/images.zon" --label "$v" --expect "$e" ;;
     *) return 1 ;;
   esac
 }
@@ -100,16 +109,31 @@ done
 log "lein deps"
 lein deps > "$out/logs/lein-deps.log" 2>&1 || { log "lein deps failed"; finish 2; }
 
-printf 'test\texit\tseconds\tstore\n' > "$out/summary.tsv"
+# The verdict a test wrote into its own store directory, if it made one.
+outcome_of() {
+  local dir=$1 f
+  f="$dir/stale-register.edn"
+  if [ -f "$f" ]; then
+    grep -m1 -oE '^[{ ]*:outcome :[a-z-]+' "$f" | awk '{print $2}' || echo -
+  else
+    echo -
+  fi
+}
+
+printf 'test\texit\toutcome\tseconds\tstore\n' > "$out/summary.tsv"
 failed=0
 for t in $tests; do
   read -r -a a <<<"$(args_for "$t")"
   log "start $t: lein ${a[*]}"
   start=$(date +%s)
+  before=$(readlink -f store/latest 2>/dev/null || echo -)
   lein "${a[@]}" > "$out/logs/$t.log" 2>&1
   rc=$?
   store=$(readlink -f store/latest 2>/dev/null || echo -)
-  printf '%s\t%s\t%s\t%s\n' "$t" "$rc" "$(( $(date +%s) - start ))" "${store#"$zj/harness/"}" >> "$out/summary.tsv"
+  # A test that crashed before Jepsen made its store leaves store/latest on
+  # the one before: neither its directory nor its outcome is this test's.
+  if [ "$store" = "$before" ]; then store=-; outcome=-; else outcome=$(outcome_of "$store"); fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$t" "$rc" "${outcome:--}" "$(( $(date +%s) - start ))" "${store#"$zj/harness/"}" >> "$out/summary.tsv"
   log "end $t: exit $rc"
   [ "$rc" = 0 ] || failed=1
 done

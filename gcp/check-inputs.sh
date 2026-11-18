@@ -50,6 +50,12 @@ check() {
     fail "time_limit must be a whole number of seconds, 30 to 1800"
   fi
   [[ "$tests" =~ ^[a-z0-9\ -]+$ ]] || fail "tests: names separated by spaces"
+  # stale-register's candidate is built at zigcube_ref and its result is
+  # filed under that commit: a branch or tag would name a different tree a
+  # week later. Its control is pinned in gcp.yml.
+  if [[ " $tests " == *" stale-register-"* ]] && ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+    fail "zigcube_ref: stale-register-* tests need a full 40-hex commit, not $ref"
+  fi
   local t n=0 total=$SETUP
   for t in $tests; do
     grep -qx -- "$t" <<<"${known//[[:space:]]/$'\n'}" || fail "unknown test: $t"
@@ -81,6 +87,10 @@ self_test() {
     "fb385b2|api-fencedx|120"
     "fb385b2|stale-register|120"
     "fb385b2||120"
+    # stale-register at a branch, a tag or a short sha.
+    "main|stale-register-candidate|120"
+    "v1.2.3|api-fenced stale-register-control|120"
+    "7d141a7|stale-register-candidate stale-register-control|120"
     "-fb385b2|api-fenced|120"
     "refs/../x|api-fenced|120"
     "x;id|api-fenced|120"

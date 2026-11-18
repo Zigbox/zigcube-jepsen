@@ -216,6 +216,10 @@ jobs:
           if [ "$STALE_REGISTER" = true ]; then
             barrier=(-Doptimize=ReleaseSafe -Dcpu=baseline -Dregister-barrier=true)
             sr="$b/stale-register"
+            # A ref without #281 (7d141a7) has no barrier option; say so
+            # here rather than as zig's "invalid option".
+            "$zig" build -h | grep -q -- '-Dregister-barrier' \
+              || { echo "::error::zigcube_ref $(git rev-parse HEAD) has no -Dregister-barrier (it needs Zigbox/zigcube#281)"; exit 1; }
             "$zig" build "${barrier[@]}" -p "${RUNNER_TEMP}/sr-candidate"
             (
               cd ../zigcube-control
@@ -235,12 +239,32 @@ jobs:
             for f in "$sr"/*/bin/zcube-server; do
               grep -q ZCUBE_TEST_REGISTER_BARRIER "$f" || { echo "::error::$f has no barrier"; exit 1; }
             done
-            # And the dist tarball (and bin/) must not have it.
+            # And nothing shipped may have it: bin/, every file in dist/
+            # (loose binaries too), and every archive there, unpacked. An
+            # archive that does not unpack, or a dist/ with no archive,
+            # fails the step rather than passing it unchecked.
             shipped="${RUNNER_TEMP}/shipped"
             mkdir -p "$shipped" && cp "$b/bin/zcube-server" "$shipped/"
-            find "$b/dist" -name '*.tar.gz' -exec tar -xzf {} -C "$shipped" \; 2>/dev/null || true
-            if grep -rlq ZCUBE_TEST_REGISTER_BARRIER "$shipped"; then
-              echo "::error::a shipped build has the barrier: $(grep -rl ZCUBE_TEST_REGISTER_BARRIER "$shipped")"; exit 1
+            if [ -d "$b/dist" ]; then
+              n=0
+              while IFS= read -r -d '' a; do
+                d="$shipped/archive-$n"; mkdir -p "$d"
+                case "$a" in
+                  *.tar.gz|*.tgz) tar -xzf "$a" -C "$d" ;;
+                  *.tar.xz) tar -xJf "$a" -C "$d" ;;
+                  *.tar.zst) tar --zstd -xf "$a" -C "$d" ;;
+                  *.zip) unzip -q "$a" -d "$d" ;;
+                esac || { echo "::error::cannot unpack $a"; exit 1; }
+                n=$((n + 1))
+              done < <(find "$b/dist" -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar.xz' \
+                         -o -name '*.tar.zst' -o -name '*.zip' \) -print0)
+              [ "$n" -gt 0 ] || { echo "::error::dist/ has no archive to check"; exit 1; }
+              echo "stale-register: checked bin/, dist/ and $n archive(s) for the barrier"
+            fi
+            scan=("$shipped" "$b/bin")
+            [ -d "$b/dist" ] && scan+=("$b/dist")
+            if grep -rlq ZCUBE_TEST_REGISTER_BARRIER "${scan[@]}"; then
+              echo "::error::a shipped build has the barrier: $(grep -rl ZCUBE_TEST_REGISTER_BARRIER "${scan[@]}")"; exit 1
             fi
             echo "stale-register: candidate $(cat "$sr/candidate/COMMIT"), control $(cat "$sr/control/COMMIT")" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -343,9 +367,9 @@ jobs:
           gcp/ci.sh fetch && rc=0 || rc=$?
           if [ -f "$RESULTS/out/summary.tsv" ]; then
             {
-              echo '| test | exit | seconds | store |'
-              echo '|---|---|---|---|'
-              tail -n +2 "$RESULTS/out/summary.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" |"}'
+              echo '| test | exit | outcome | seconds | store |'
+              echo '|---|---|---|---|---|'
+              tail -n +2 "$RESULTS/out/summary.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" | "$5" |"}'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           for f in "$RESULTS"/out/logs/*.log; do
