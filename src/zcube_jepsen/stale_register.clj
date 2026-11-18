@@ -22,10 +22,13 @@
   Steps (the nemesis does them in order, each an op in the history), for the
   first agent node (n4; the brief's n1):
     :start-agent :await-registered     the agent holds a tenure (L0)
-    :arm                               arm-n4
-    :kill-agent :start-agent           a re-registration: it grants L1
+    :kill-agent :await-expired         stopped past the ttl: L0 ends and
+                                       /nodes/n4 is deleted
+    :arm :start-agent                  arm-n4; it grants L1 and registers
     :await-held                        held-n4-L1: the PUT on L1 waits
-    :kill-agent :start-agent           again: it grants L2 and registers
+    :kill-agent :forget-lease          killed, its saved lease (lease.json)
+    :start-agent                       removed: it grants L2 (L1 still
+                                       live) and registers
     :await-registered                  /nodes/n4 on L2 (> L1), ready
     :release :await-done               release-n4-L1, then done-n4-L1
     :read-nodes                        GET /v1/nodes?at=N
@@ -69,6 +72,11 @@
   "The barrier's directory on the server node. Outside zcube/state-dir,
   which the server's setup removes after this db made the directory."
   "/var/lib/zj-barrier")
+
+(def lease-file
+  "Where the agent keeps its lease, in its --state-dir (Zigcube agent.zig,
+  `lease_file`)."
+  "lease.json")
 
 (def clock-margin-ms
   "How far before L1's earliest end the released transaction must run: the
@@ -202,6 +210,24 @@
                     (stale-put/agent-log-tail test n))
               :timed-out)))
 
+      :await-expired
+      ; The stopped agent's lease (L0) ran out: the server deleted /nodes/<n>,
+      ; so the next start must grant a new lease and register.
+      (let [ms (+ (:lease-ttl-ms test) (:lost-grace-ms test 1000) 15000)
+            r  (poll! ms (fn []
+                           (let [v (nodes-view http test n nil)]
+                             (when (and (= 200 (:status v)) (nil? (:node v)))
+                               {:revision (:revision v) :at (now-ms)}))))]
+        (or r :timed-out))
+
+      :forget-lease
+      ; The agent keeps its lease in its state directory and resumes it after
+      ; a restart (0.5.2, agent.lease_file). Without it, the restarted agent
+      ; grants a new lease while the old one is still live.
+      (do (c/on-nodes test [n]
+                      (fn [_ _] (c/su (c/exec :rm :-f (str zcube/state-dir "/agent/" lease-file)))))
+          lease-file)
+
       :arm (do (touch! test (str "arm-" n)) (str "arm-" n))
 
       :await-held
@@ -256,8 +282,9 @@
 (defn steps [_test]
   (mapv (fn [f] {:type :info :f f :value nil})
         [:start-agent :await-registered
-         :arm :kill-agent :start-agent :await-held
-         :kill-agent :start-agent :await-registered
+         :kill-agent :await-expired
+         :arm :start-agent :await-held
+         :kill-agent :forget-lease :start-agent :await-registered
          :release :await-done :read-nodes :collect]))
 
 ;; ---------------------------------------------------------------- checks

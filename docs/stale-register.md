@@ -40,11 +40,17 @@ The held node is the first agent node, n4. The brief that asked for this
 test calls it n1. The steps:
 
 1. Start n4's agent and wait until it is registered and ready (lease L0).
-2. Arm n4.
-3. Kill the agent and start it again. The new agent grants L1 and
-   registers, and the barrier holds that PUT. Wait for `held-n4-L1`.
-4. Kill it and start it again. It grants L2 and registers, and that PUT is
-   not held. Wait until `/nodes/n4` is on L2 (L2 > L1) and ready.
+2. Stop the agent and wait until L0 has run out: the server deletes
+   `/nodes/n4`. A plain restart would not do, as the 0.5.2 agent keeps its
+   lease in `lease.json` in its state directory and resumes it, with no new
+   registration.
+3. Arm n4 and start the agent. It grants L1 and registers, and the barrier
+   holds that PUT. Wait for `held-n4-L1`.
+4. Kill the agent, remove its `lease.json`, and start it again. It grants L2
+   while L1 is still live, and registers; that PUT is not held. Wait until
+   `/nodes/n4` is on L2 (L2 > L1) and ready. (Removing the file stands for an
+   agent that lost its state, the one way to get a second grant while L1
+   lives.)
 5. Write `release-n4-L1`, then wait for `done-n4-L1`.
 6. Read `GET /v1/nodes?at=N`. N is the revision the released PUT wrote if it
    succeeded. Otherwise N is the server's revision read right after `done`.

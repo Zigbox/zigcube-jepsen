@@ -18,7 +18,7 @@
 
 (defn- op [f v] {:type :info :process :nemesis :f f :value v})
 
-(def ttl 20000)
+(def ttl 10000)
 
 (defn- history
   "A run's steps: L0 = 3, L1 = 4, L2 = 5; `done` and `read` are what the
@@ -26,11 +26,13 @@
   [{:keys [done read rows started] :or {started 1000000}}]
   [(op :start-agent {:node "n4" :at 990000})
    (op :await-registered {:lease 3 :mod-revision 2 :revision 3 :at 995000})
-   (op :arm "arm-n4")
    (op :kill-agent "n4")
+   (op :await-expired {:revision 5 :at 999000})
+   (op :arm "arm-n4")
    (op :start-agent {:node "n4" :at started})
    (op :await-held {:lease 4 :agent-started started :held "succeeded 0 revision 0 at_ms 1"})
    (op :kill-agent "n4")
+   (op :forget-lease "lease.json")
    (op :start-agent {:node "n4" :at 1002000})
    (op :await-registered {:lease 5 :mod-revision 9 :revision 10 :at 1003000})
    (op :release {:lease 4 :at 1004000})
