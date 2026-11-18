@@ -1,0 +1,32 @@
+{:index 0, :time 97825582, :type :info, :process :nemesis, :f :start-agent, :value nil}
+{:index 1, :time 231004566, :type :info, :process :nemesis, :f :start-agent, :value {:node "n4", :at 1795029463578}}
+{:index 2, :time 231116526, :type :info, :process :nemesis, :f :await-registered, :value nil}
+{:index 3, :time 593432096, :type :info, :process :nemesis, :f :await-registered, :value {:lease 1, :mod-revision 1, :revision 3, :at 1795029464066}}
+{:index 4, :time 593501146, :type :info, :process :nemesis, :f :kill-agent, :value nil}
+{:index 5, :time 644084968, :type :info, :process :nemesis, :f :kill-agent, :value "n4"}
+{:index 6, :time 644920108, :type :info, :process :nemesis, :f :await-expired, :value nil}
+{:index 7, :time 10563137398, :type :info, :process :nemesis, :f :await-expired, :value {:revision 4, :at 1795029474038}}
+{:index 8, :time 10563230438, :type :info, :process :nemesis, :f :arm, :value nil}
+{:index 9, :time 10615807291, :type :info, :process :nemesis, :f :arm, :value "arm-n4"}
+{:index 10, :time 10615885091, :type :info, :process :nemesis, :f :start-agent, :value nil}
+{:index 11, :time 10737755479, :type :info, :process :nemesis, :f :start-agent, :value {:node "n4", :at 1795029474092}}
+{:index 12, :time 10737836809, :type :info, :process :nemesis, :f :await-held, :value nil}
+{:index 13, :time 11123818563, :type :info, :process :nemesis, :f :await-held, :value {:lease 2, :agent-started 1795029474092, :held "succeeded 0 revision 0 at_ms 1795029474318"}}
+{:index 14, :time 11123889473, :type :info, :process :nemesis, :f :kill-agent, :value nil}
+{:index 15, :time 11162900018, :type :info, :process :nemesis, :f :kill-agent, :value "n4"}
+{:index 16, :time 11163148389, :type :info, :process :nemesis, :f :forget-lease, :value nil}
+{:index 17, :time 11240363717, :type :info, :process :nemesis, :f :forget-lease, :value "lease.json"}
+{:index 18, :time 11240479618, :type :info, :process :nemesis, :f :start-agent, :value nil}
+{:index 19, :time 11397950827, :type :info, :process :nemesis, :f :start-agent, :value {:node "n4", :at 1795029474716}}
+{:index 20, :time 11398024878, :type :info, :process :nemesis, :f :await-registered, :value nil}
+{:index 21, :time 11620575199, :type :info, :process :nemesis, :f :await-registered, :value {:lease 3, :mod-revision 6, :revision 8, :at 1795029475095}}
+{:index 22, :time 11620643878, :type :info, :process :nemesis, :f :release, :value nil}
+{:index 23, :time 11669208379, :type :info, :process :nemesis, :f :release, :value {:lease 2, :at 1795029475096}}
+{:index 24, :time 11669285239, :type :info, :process :nemesis, :f :await-done, :value nil}
+{:index 25, :time 11862654802, :type :info, :process :nemesis, :f :await-done, :value {:succeeded true, :revision 9, :at-ms 1795029475154, :lease 2, :leases [{:id 2, :deadline-ms 1795029484267, :live true, :read-at-ms 1795029475319} {:id 3, :deadline-ms 1795029484920, :live true, :read-at-ms 1795029475319}], :server-revision-after 10}}
+{:index 26, :time 11862727882, :type :info, :process :nemesis, :f :read-nodes, :value nil}
+{:index 27, :time 11874878850, :type :info, :process :nemesis, :f :read-nodes, :value {:status 200, :revision 9, :truncated false, :node {:lease 2, :mod-revision 9}, :state "ready", :at 9}}
+{:index 28, :time 11874956280, :type :info, :process :nemesis, :f :observe-after, :value nil}
+{:index 29, :time 28211723309, :type :info, :process :nemesis, :f :observe-after, :value {:for-ms 16000, :changes [{:node {:lease 2, :mod-revision 9}, :state "ready", :status 200, :at-ms 1795029475361} {:node {:lease 4, :mod-revision 11}, :state "ready", :status 200, :at-ms 1795029478931}], :last {:node {:lease 4, :mod-revision 11}, :state "ready", :status 200, :at-ms 1795029478931}}}
+{:index 30, :time 28211791409, :type :info, :process :nemesis, :f :collect, :value nil}
+{:index 31, :time 28370049780, :type :info, :process :nemesis, :f :collect, :value {:store {:rows [{:rev 1, :idx 0, :key "/nodes/n4", :deleted false, :lease 1, :value {:v 1, :name "n4", :agent_version "0.5.2", :address "", :capacity {:cpu_millis 4000, :memory_bytes 8589934592}, :labels [], :trust_policy ""}} {:rev 2, :idx 3, :key "/node-status/n4", :deleted false, :lease 0, :value {:v 1, :state "ready", :tenure 1, :at_ms 1795029463838, :decision "1795029463837-4770-0000"}} {:rev 4, :idx 1, :key "/nodes/n4", :deleted true, :lease 1, :value nil} {:rev 5, :idx 3, :key "/node-status/n4", :deleted false, :lease 0, :value {:v 1, :state "lost", :tenure 1, :at_ms 1795029474039, :decision "1795029474038-4770-0001"}} {:rev 6, :idx 0, :key "/nodes/n4", :deleted false, :lease 3, :value {:v 1, :name "n4", :agent_version "0.5.2", :address "", :capacity {:cpu_millis 4000, :memory_bytes 8589934592}, :labels [], :trust_policy ""}} {:rev 7, :idx 3, :key "/node-status/n4", :deleted false, :lease 0, :value {:v 1, :state "ready", :tenure 6, :at_ms 1795029474988, :decision "1795029474987-4770-0002"}} {:rev 9, :idx 0, :key "/nodes/n4", :deleted false, :lease 2, :value {:v 1, :name "n4", :agent_version "0.5.2", :address "", :capacity {:cpu_millis 4000, :memory_bytes 8589934592}, :labels [], :trust_policy ""}} {:rev 10, :idx 3, :key "/node-status/n4", :deleted false, :lease 0, :value {:v 1, :state "ready", :tenure 9, :at_ms 1795029475158, :decision "1795029475158-4770-0003"}} {:rev 11, :idx 0, :key "/nodes/n4", :deleted false, :lease 4, :value {:v 1, :name "n4", :agent_version "0.5.2", :address "", :capacity {:cpu_millis 4000, :memory_bytes 8589934592}, :labels [], :trust_policy ""}} {:rev 12, :idx 3, :key "/node-status/n4", :deleted false, :lease 0, :value {:v 1, :state "ready", :tenure 11, :at_ms 1795029478448, :decision "1795029478448-4770-0004"}}], :compacted 0}, :server-log ["[1795029463829] r-f017dbad-0000005 PUT /v1/agent/nodes/n4 -> 200 (23 ms)" "[1795029474983] r-f017dbad-0000040 PUT /v1/agent/nodes/n4 -> 200 (13 ms)" "[1795029475154] r-f017dbad-0000044 PUT /v1/agent/nodes/n4 -> 200 (838 ms)" "[1795029478441] r-f017dbad-0000064 PUT /v1/agent/nodes/n4 -> 200 (19 ms)"], :end 1795029491845}}
