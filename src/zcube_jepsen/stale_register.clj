@@ -298,7 +298,8 @@
   "What the checker judges, from the steps' values."
   [history node ttl-ms]
   (let [infos (filter #(and (= :info (:type %)) (= :nemesis (:process % :nemesis))) history)
-        vals  (fn [f] (->> infos (filter #(= f (:f %))) (map :value)))
+        ; The nemesis logs each step twice, invoked (value nil) and done.
+        vals  (fn [f] (->> infos (filter #(= f (:f %))) (keep :value)))
         regs  (vals :await-registered)
         held  (last (vals :await-held))
         done  (last (vals :await-done))

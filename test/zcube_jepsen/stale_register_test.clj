@@ -53,6 +53,15 @@
     (is (:valid? j) (pr-str j))
     (is (= :refused (:outcome j)))))
 
+(deftest invocations-are-skipped
+  (testing "each step's invocation (value nil) before its completion, as Jepsen records them"
+    (let [h (history {:done {:succeeded false :revision 0 :at-ms 1004100 :lease 4}
+                      :read {:status 200 :revision 12 :truncated false :at 12
+                             :node {:lease 5 :mod-revision 9} :state "ready"}
+                      :rows [(put 2 3) (put 9 5)]})
+          j (sr/judge (sr/analyse (mapcat (fn [o] [(assoc o :value nil) o]) h) "n4" ttl))]
+      (is (= :refused (:outcome j)) (pr-str j)))))
+
 (deftest control-fails-and-says-so
   (let [j (judged (history
                     {:done {:succeeded true :revision 13 :at-ms 1004100 :lease 4}
