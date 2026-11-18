@@ -117,6 +117,13 @@
                 (c/upload (str f) watcher))
               (c/su (c/exec :chmod :+x watcher))
               (start-watcher!)
+              ; The hold proxy (hold_proxy.clj) reads and holds plain
+              ; HTTP between agent and server: it cannot sit inside mTLS.
+              (when (:tls? (zcube/await-tls test))
+                (throw (ex-info (str "stale-put's hold proxy needs plain HTTP;"
+                                     " this zcube-server serves only mTLS"
+                                     " on --listen (Zigcube B7+)")
+                                {:node node})))
               (zcube/await-server! test))
           (db/setup! zdb test node)))
       (teardown! [_ test node]
@@ -167,8 +174,7 @@
 
 ;; ---------------------------------------------------------------- the server
 
-(defn server-base [test]
-  (str "http://" (zcube/server-node test) ":" zcube/port))
+(defn server-base [test] (zcube/base-url test))
 
 (defn list-prefix
   "The kvs under `prefix` through /v1/list."
@@ -364,7 +370,7 @@
               proxy (hp/start! (:proxy-port test)
                                [(zcube/server-node test) zcube/port]
                                (held-node test))]
-          (swap! st assoc :proxy proxy :http (api/http-client) :control-ip ip)
+          (swap! st assoc :proxy proxy :http (api/http-client test) :control-ip ip)
           this))
       (invoke! [_ test op]
         (let [v (try (step! test st op)
@@ -721,6 +727,7 @@
 (defn stale-put-test [opts]
   (merge tests/noop-test
          opts
+         (zcube/tls-test-keys)
          {:name      (str "zcube-stale-put-" (name (:release-after opts)))
           :os        os/noop
           :db        (db)

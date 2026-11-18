@@ -33,6 +33,24 @@
   (let [n (atom -1)]
     (fn [_ _] {:type :invoke :f :write :value (swap! n inc)})))
 
+(def api-value-limit
+  "api writes value v as a service of v+1 replicas, and Zigcube caps a service
+  at 128 replicas: a write of 128 or more is refused (400 ZC-E0104) and tells
+  the checkers nothing. So api values stay below this."
+  128)
+
+(defn capped-ops
+  "A read and a unique write (as `unique-writes`) whose values stay below
+  `limit` (call it once per key). Once the key's values are used up both
+  generators are exhausted, so the key ends and the workers move on to a
+  fresh one."
+  [limit]
+  (let [n     (atom -1)
+        left? (fn [] (< (inc @n) limit))]
+    [(fn [_ _] (when (left?) {:type :invoke :f :read :value nil}))
+     (fn [_ _] (let [v (swap! n inc)]
+                 (when (< v limit) {:type :invoke :f :write :value v})))]))
+
 (defn unique-ops
   "Writes and cas ops whose new values are never repeated within one key (call
   it once per key). A cas expects the value of the latest write handed out
@@ -77,7 +95,7 @@
    "api" {:name       "zcube-register-api"
           :db         zcube/db
           :client     api/client
-          :ops        (fn [] [r (unique-writes)])
+          :ops        (fn [] (capped-ops api-value-limit))
           :fs         [:read :write]
           :model      model/register
           :on-promote zcube/on-promote
@@ -129,6 +147,7 @@
         wl    (workloads (:workload opts))]
     (merge tests/noop-test
            opts
+           (zcube/tls-test-keys)
            {:name      (:name wl)
             :os        os/noop
             :db        ((:db wl))
@@ -245,6 +264,7 @@
   (let [n (:services opts)]
     (merge tests/noop-test
            opts
+           (zcube/tls-test-keys)
            {:name      (str "zcube-lease-" (name (:expect opts))
                              (some->> (:lease-faults opts) name (str "-")))
             :os        os/noop
@@ -308,6 +328,11 @@
     :default 10000 :parse-fn parse-long]
    [nil "--ops-per-key N" "Operations per independent key."
     :default 60 :parse-fn parse-long]
+   [nil "--zcube-tls MODE"
+    (str "auto: mTLS if `zcube-server --help` lists `ca issue-client` (B7+)."
+         " on/off: override that guess.")
+    :id :zcube-tls-mode :default :auto :parse-fn keyword
+    :validate [#{:auto :on :off} "must be auto, on or off"]]
    [nil "--min-failovers N" "Fail the run if fewer failovers completed."
     :default 1 :parse-fn parse-long]
    [nil "--failover MODE"
