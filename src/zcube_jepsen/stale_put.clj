@@ -727,8 +727,8 @@
 (defn stale-put-test [opts]
   (merge tests/noop-test
          opts
+         (zcube/tls-test-keys)
          {:name      (str "zcube-stale-put-" (name (:release-after opts)))
-          :zcube-tls (zcube/tls-state)
           :os        os/noop
           :db        (db)
           :nemesis   (the-nemesis)

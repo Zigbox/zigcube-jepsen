@@ -69,7 +69,11 @@
 ;;
 ;; The mode and the control node's copies live in the test's :zcube-tls atom
 ;; (`tls-state`): nil until the server node has set them up, then
-;; {:tls? false} or {:tls? true :dir :ca :cert :key :nodes :ssl-context}.
+;; {:tls? false} or {:tls? true :dir :ca :cert :key :nodes :ssl-context}, or
+;; {:failed e} if the server node's setup failed (the agent nodes, waiting in
+;; `await-tls`, then fail at once). Jepsen cannot write an SSLContext, and the
+;; key paths have no business in test.jepsen, so every test map that holds
+;; the atom also lists it in :nonserializable-keys (`tls-test-keys`).
 
 (def tls-name
   "The DNS name in the server's certificate (zcube-server's default)."
@@ -82,31 +86,64 @@
   []
   (atom nil))
 
+(defn tls-test-keys
+  "What a test map needs for the TLS mode: the :zcube-tls atom, kept out of
+  what Jepsen's store writes (it holds an SSLContext, which Fressian cannot
+  write, and the control node's key paths)."
+  []
+  {:zcube-tls           (tls-state)
+   :nonserializable-keys #{:zcube-tls}})
+
 (defn- tls-atom [test]
   (or (:zcube-tls test)
       (throw (IllegalStateException. "the test map has no :zcube-tls (zcube/tls-state)"))))
 
+(defn- check-tls [state]
+  (when-let [e (:failed state)]
+    (throw (ex-info "the server node's setup failed" {:type ::server-setup-failed} e)))
+  state)
+
 (defn tls
-  "The TLS mode the server node set up; throws if it has not yet."
+  "The TLS mode the server node set up; throws if it has not yet, or if its
+  setup failed."
   [test]
-  (or @(tls-atom test)
+  (or (check-tls @(tls-atom test))
       (throw (IllegalStateException. "zcube-server's TLS mode is not set up yet"))))
 
 (defn await-tls
-  "Waits for the server node to set up the TLS mode, and returns it."
-  [test]
-  (util/await-fn (fn [] (tls test))
-                 {:retry-interval 500 :log-interval 10000 :timeout 300000
-                  :log-message "waiting for the server node's certificates"}))
+  "Waits for the server node to set up the TLS mode, and returns it. Throws at
+  once if the server node's setup failed, rather than waiting out the
+  timeout."
+  ([test] (await-tls test 300000))
+  ([test timeout-ms]
+   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+     (loop [logged (System/currentTimeMillis)]
+       (if-let [state (check-tls @(tls-atom test))]
+         state
+         (let [now (System/currentTimeMillis)]
+           (when (> now deadline)
+             (throw (ex-info "timed out waiting for the server node's certificates"
+                             {:type ::tls-timeout :timeout-ms timeout-ms})))
+           (when (> (- now logged) 10000)
+             (info "waiting for the server node's certificates"))
+           (Thread/sleep 500)
+           (recur (if (> (- now logged) 10000) now logged))))))))
 
 (defn tls? [test] (:tls? (tls test)))
 
 (defn tls-capable?
   "True if the installed zcube-server issues client certificates (B7 and
-  later), so its --listen is mTLS. Run on the server node."
-  []
-  (-> (c/exec :bash :-c (str dir "/zcube-server --help 2>&1 || true"))
-      (str/includes? "ca issue-client")))
+  later), so its --listen is mTLS. Run on the server node. `mode` is the
+  test's :zcube-tls-mode (--zcube-tls): :on or :off override the guess,
+  which reads the top-level --help (bounded, so a binary that ignores --help
+  cannot hang setup)."
+  ([] (tls-capable? :auto))
+  ([mode]
+   (case (or mode :auto)
+     :on   true
+     :off  false
+     :auto (-> (c/exec :bash :-c (str "timeout 10 " dir "/zcube-server --help 2>&1 || true"))
+               (str/includes? "ca issue-client")))))
 
 (defn base-url
   "Where the control node's clients reach the API."
@@ -116,18 +153,23 @@
 (def ^:private owner-only
   (PosixFilePermissions/fromString "rw-------"))
 
-(defn- local-tls-dir!
-  "A fresh directory of the control node's, mode 0700."
-  ^File []
-  (.toFile (Files/createTempDirectory
-             "zcube-tls-"
-             (into-array FileAttribute
-                         [(PosixFilePermissions/asFileAttribute
-                            (PosixFilePermissions/fromString "rwx------"))]))))
-
 (defn- rm-local! [^File f]
   (when (.isDirectory f) (run! rm-local! (.listFiles f)))
   (.delete f))
+
+(defn- local-tls-dir!
+  "A fresh directory of the control node's, mode 0700. Removed at teardown,
+  on a failed setup, and, failing both (--leave-db-running, an interrupted
+  run), when the JVM exits."
+  ^File []
+  (let [d (.toFile (Files/createTempDirectory
+                     "zcube-tls-"
+                     (into-array FileAttribute
+                                 [(PosixFilePermissions/asFileAttribute
+                                    (PosixFilePermissions/fromString "rwx------"))])))]
+    (.addShutdownHook (Runtime/getRuntime)
+                      (Thread. ^Runnable (fn [] (rm-local! d)) "zcube-tls-cleanup"))
+    d))
 
 (defn- fetch!
   "Downloads `remote` on this node into `local`, mode 0600."
@@ -227,20 +269,24 @@
   (doseq [n (agent-nodes test)]
     (issue! :node n (str tls-dir "/nodes")))
   (let [local (local-tls-dir!)
-        get!  (fn [remote local-name] (fetch! remote (io/file local local-name)))
-        ca    (get! (str tls-dir "/ca.crt") "ca.crt")
-        cert  (get! (str tls-dir "/client/" client-name ".crt") "client.crt")
-        key   (get! (str tls-dir "/client/" client-name ".key") "client.key")
-        nodes (into {} (for [n (agent-nodes test)]
-                         [n {:cert (get! (str tls-dir "/nodes/" n ".crt") (str n ".crt"))
-                             :key  (get! (str tls-dir "/nodes/" n ".key") (str n ".key"))}]))]
-    {:tls?        true
-     :dir         (str local)
-     :ca          ca
-     :cert        cert
-     :key         key
-     :nodes       nodes
-     :ssl-context (ssl-context ca cert key tls-name)}))
+        get!  (fn [remote local-name] (fetch! remote (io/file local local-name)))]
+    (try
+      (let [ca    (get! (str tls-dir "/ca.crt") "ca.crt")
+            cert  (get! (str tls-dir "/client/" client-name ".crt") "client.crt")
+            key   (get! (str tls-dir "/client/" client-name ".key") "client.key")
+            nodes (into {} (for [n (agent-nodes test)]
+                             [n {:cert (get! (str tls-dir "/nodes/" n ".crt") (str n ".crt"))
+                                 :key  (get! (str tls-dir "/nodes/" n ".key") (str n ".key"))}]))]
+        {:tls?        true
+         :dir         (str local)
+         :ca          ca
+         :cert        cert
+         :key         key
+         :nodes       nodes
+         :ssl-context (ssl-context ca cert key tls-name)})
+      (catch Throwable t
+        (rm-local! local)
+        (throw t)))))
 
 (defn install-node-tls!
   "On an agent node: its node certificate, key and the CA, from the control
@@ -255,11 +301,13 @@
     (c/su (c/exec :chmod "0600" (str tls-dir "/node.key") (str tls-dir "/node.crt")))))
 
 (defn teardown-tls!
-  "Forgets the TLS mode and removes the control node's copies."
-  [test]
-  (when-let [{:keys [dir]} @(tls-atom test)]
-    (when dir (rm-local! (io/file dir))))
-  (reset! (tls-atom test) nil))
+  "Removes the control node's copies, and sets the TLS mode to `state` (nil:
+  not set up)."
+  ([test] (teardown-tls! test nil))
+  ([test state]
+   (when-let [{:keys [dir]} @(tls-atom test)]
+     (when dir (rm-local! (io/file dir))))
+   (reset! (tls-atom test) state)))
 
 (defn start-server!
   "`tls?`: the binary serves mTLS on --listen (`tls-capable?`)."
@@ -270,9 +318,10 @@
       (str dir "/zcube-server")
       (concat
         [:--listen (str "0.0.0.0:" port)]
-        ; The certificate the agents and the clients check names --tls-name;
-        ; --tls-san (the browser path's certificate) adds the address.
-        (when tls? [:--tls-name tls-name :--tls-san (cn/ip (server-node test))])
+        ; The certificate the agents and the clients check names --tls-name.
+        ; No --tls-san: that is the browser path's P-256 certificate, which
+        ; the JDK and curl (both offer ed25519) never see.
+        (when tls? [:--tls-name tls-name])
         [:--store store-spec
          :--state-dir server-state-dir
          :--lease-ttl-ms (:lease-ttl-ms test 10000)
@@ -282,30 +331,41 @@
 (defn stop-server! []
   (c/su (cu/stop-daemon! (str dir "/zcube-server") server-pid)))
 
+(def node-status-code
+  "What /v1/status answers a node certificate: 403 with this code (a node may
+  call its own paths only, Zigcube docs/mtls.md)."
+  "ZC-E0822")
+
+(defn await-server-cmd
+  "The shell command `await-server!` retries: exits 0 once the server is up.
+  Over mTLS the server node presents the admin certificate and wants a 2xx;
+  an agent node presents its node certificate, which /v1/status refuses, so
+  there only that exact refusal (403 `node-status-code`) means the server is
+  up and took the node's certificate as a node's."
+  [tls? server? ip]
+  (if-not tls?
+    (str "curl -fsS -m 3 -o /dev/null http://" ip ":" port "/v1/status")
+    (let [[cert key] (if server?
+                       [(str tls-dir "/client/" client-name ".crt")
+                        (str tls-dir "/client/" client-name ".key")]
+                       [(str tls-dir "/node.crt") (str tls-dir "/node.key")])
+          curl (str "curl -sS -m 3 --noproxy '*' -w '\\n%{http_code}'"
+                    " --cacert " tls-dir "/ca.crt"
+                    " --cert " cert " --key " key
+                    " --resolve " tls-name ":" port ":" ip
+                    " https://" tls-name ":" port "/v1/status")]
+      (str "out=$(" curl ") || exit 1; code=${out##*$'\\n'}; echo \"HTTP $code\"; "
+           (if server?
+             "[ \"$code\" -ge 200 ] && [ \"$code\" -lt 300 ]"
+             (str "[ \"$code\" = 403 ] && case \"$out\" in *" node-status-code
+                  "*) true;; *) false;; esac"))))))
+
 (defn await-server!
-  "Blocks until the server answers /v1/status. Run on the server node or an
-  agent node. Over mTLS the server node presents the admin certificate and
-  wants a 2xx; an agent node presents its node certificate, which /v1/status
-  refuses (403: a node may call its own paths only), so there any answer
-  below 500 means the server is up and took the certificate."
+  "Blocks until the server answers /v1/status (`await-server-cmd`). Run on
+  the server node or an agent node."
   [test]
-  (let [ip   (cn/ip (server-node test))
-        cmd  (if-not (tls? test)
-               (str "curl -fsS -m 3 -o /dev/null http://" ip ":" port "/v1/status")
-               (let [server? (= c/*host* (server-node test))
-                     [cert key] (if server?
-                                  [(str tls-dir "/client/" client-name ".crt")
-                                   (str tls-dir "/client/" client-name ".key")]
-                                  [(str tls-dir "/node.crt") (str tls-dir "/node.key")])
-                     curl (str "curl -sS -m 3 -o /dev/null -w '%{http_code}'"
-                               " --cacert " tls-dir "/ca.crt"
-                               " --cert " cert " --key " key
-                               " --resolve " tls-name ":" port ":" ip
-                               " https://" tls-name ":" port "/v1/status")]
-                 (str "code=$(" curl ") || exit 1; echo \"HTTP $code\"; "
-                      (if server?
-                        "[ \"$code\" -ge 200 ] && [ \"$code\" -lt 300 ]"
-                        "[ \"$code\" -ge 200 ] && [ \"$code\" -lt 500 ]"))))]
+  (let [cmd (await-server-cmd (tls? test) (= c/*host* (server-node test))
+                              (cn/ip (server-node test)))]
     (util/await-fn
       (fn [] (c/su (c/exec :bash :-c cmd)))
       {:retry-interval 500 :log-interval 5000 :timeout 90000
@@ -386,7 +446,7 @@
               (point-pg! primary)
               (pg/await-primary! "pg")
               (pg/await-standby! test "pg")
-              (let [tls? (tls-capable?)]
+              (let [tls? (tls-capable? (:zcube-tls-mode test))]
                 (info "zcube-server" (if tls? "speaks mTLS on --listen" "has no TLS (before B7)"))
                 (try (start-server! test tls?)
                      ; Set only once complete: the agent nodes wait for it.
@@ -394,7 +454,9 @@
                      (await-server! test)
                      (catch Exception e
                        (diagnose-server!)
-                       (reset! (tls-atom test) nil)
+                       ; Remove the control node's keys, and let the agent
+                       ; nodes fail now rather than at await-tls's timeout.
+                       (teardown-tls! test {:failed e})
                        (throw e)))))
 
           :else

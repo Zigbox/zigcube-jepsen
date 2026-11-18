@@ -44,7 +44,11 @@ lease test ([below](#the-lease-test-slice-2)). The stale registration PUT
 - Write values are a per-key counter (0, 1, 2, ...), never repeated within a
   key, so a read names the exact write it saw and a rollback past an
   acknowledged write cannot be explained by an `:info` write of the same
-  value. The `pg` workload does the same since slice 1b: a cas expects the
+  value. Zigcube caps a service at 128 replicas, so a write of 128 or more
+  would be refused (`400 ZC-E0104`) and tell the checkers nothing: api
+  values stay below 128 (`core/api-value-limit`). A key whose values are used
+  up ends, and its workers move on to a fresh key. The checkers are
+  unchanged. The `pg` workload does the same since slice 1b: a cas expects the
   value of the latest write and sets a fresh one.
 - Zigcube has no multi-host connection string; the operator repoints the
   store's address after a failover. Here that address is the name `pg` in
@@ -224,7 +228,9 @@ Options: `--workload api|pg|lease`, `--zcube-bin DIR` (default
 `--expect valid|lost-write`, `--repoint-delay-ms N`, `--lag-ms N`,
 `--[no-]client-partition`; for lease: `--expect valid|overlap`,
 `--lease-faults partition|wedge`, `--services N`, `--fault-ms N`, `--lost-grace-ms N`, `--min-handovers N`,
-`--zcube-constants FILE` (default `zigcube/src/constants.zig`). `lein test` runs the checkers' unit tests. Elle
+`--zcube-constants FILE` (default `zigcube/src/constants.zig`),
+`--zcube-tls auto|on|off`. `lein test` runs the unit tests (it needs
+`openssl` and `bash` on the path). Elle
 draws the cycles it finds with graphviz (`dot`); without it, it checks
 without drawings.
 
@@ -380,18 +386,27 @@ From B7, `zcube-server --listen` serves only TLS 1.3 and requires a client
 certificate (Zigcube `docs/mtls.md`). The harness detects which kind of server
 it has: the binary is mTLS-capable if `zcube-server --help` lists
 `ca issue-client`. Older pins (`fb385b2`, `f7736a7`) keep plain HTTP. The
-harness never uses `--insecure-listen`.
+harness never uses `--insecure-listen`. `--zcube-tls on|off` overrides the
+guess (default `auto`); the `--help` call is bounded by `timeout 10`.
 
 With mTLS, `zcube.clj` does the following:
 
-- Starts the server with `--tls-name zcube-server --tls-san <server IP>`.
+- Starts the server with `--tls-name zcube-server`. It does not pass
+  `--tls-san`: that adds the browser path's P-256 certificate, which the JDK
+  client and curl (both offer ed25519) never see.
 - Issues certificates on the server node once the store and the CA exist:
   `ca issue-client jepsen --scope admin` for the harness, and
-  `ca issue-node <n>` for each agent node. They go to `/var/lib/zcube/tls`,
+  `ca issue-node <n>` for each agent node. They go to `/var/lib/zj/tls`,
   which is 0700 with keys at 0600.
 - Copies the CA certificate, the admin certificate and key, and each node's
   certificate and key to a 0700 temporary directory on the control node,
-  with keys and certificates at 0600. It deletes that directory at teardown.
+  with keys and certificates at 0600. It deletes that directory at teardown,
+  when the server node's setup fails, and otherwise (`--leave-db-running`,
+  an interrupted run) when the JVM exits. A JVM killed outright leaves it.
+- Keeps all of this (the `:zcube-tls` atom, which holds the `SSLContext`
+  and the key paths) out of `test.jepsen`, through `:nonserializable-keys`.
+  `lein test` writes a test map with a filled atom the way Jepsen's store
+  does, for each of api, lease and stale-put.
 - Uploads each agent node's certificate and key to that node. The agent runs
   with `--ca --cert --key --tls-name`.
 
@@ -402,9 +417,19 @@ Every client verifies the server against the CA and checks that its
 certificate names `zcube-server`. That name is the only DNS SAN on the
 server's Ed25519 certificate, while the clients dial an IP address:
 
-- `await-server!`'s curl uses `--resolve zcube-server:7070:<IP>`.
+- `await-server!`'s curl uses `--resolve zcube-server:7070:<IP>` (and
+  `--noproxy '*'`). On the server node it presents the admin certificate and
+  wants a 2xx from `/v1/status`; on an agent node it presents the node
+  certificate and wants exactly the refusal a node gets there, `403` with
+  `ZC-E0822`.
 - The JDK client (api, lease) wraps the PKIX trust manager in a check of the
-  SAN, as Zigcube's `ops/mtls-interop` client does.
+  SAN, as Zigcube's `ops/mtls-interop` client does. `lein test` checks it
+  against an in-process TLS 1.3 server with openssl-made Ed25519
+  certificates: the right name is accepted, a wrong name or a foreign CA is
+  refused, and the client certificate is presented.
+
+If the server node's setup fails, the agent nodes fail at once instead of
+waiting out the 300 s for the certificates.
 
 **stale-put needs plain HTTP.** Its hold proxy reads and holds the agent's
 plain-HTTP PUT, so it cannot sit inside mTLS. Against a B7+ server,
