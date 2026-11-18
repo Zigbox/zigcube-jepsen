@@ -10,8 +10,14 @@ findings. Keep them separate: the evidence for (a) is the control run, and
 | run | server | agent | result |
 |---|---|---|---|
 | stale-put CI run [44232537976](https://github.com/Zigbox/zigcube-jepsen/actions/runs/44232537976) (stale-put.yml on main b3a9898) | Zigcube **f7736a7**, the workflow's pin | f7736a7 | idle: n4 lost for 20.2 s; running: overlap 0 ms |
-| `stale-register-control` | 190f8dc (0.5.2) + barrier patch | 190f8dc | *pending: GCP dispatch after merge* |
-| `stale-register-candidate` | 7d141a7 (#281) + barrier | 190f8dc | *pending: GCP dispatch after merge* |
+| `stale-register-control`, local docker, ttl 10 s | 190f8dc (0.5.2) + barrier patch | 190f8dc | `:stale-registration-landed`, exit 1: held L1 = 2, L2 = 3 registered at revision 6; release gave `succeeded 1 revision 9` (server log: PUT 200); `/nodes/n4` at 9 on lease 2, mod_revision 9; the store holds a put at 9 on lease 2 after lease 3 |
+| `stale-register-candidate`, local docker, ttl 10 s | 7d141a7 (#281) + barrier | 190f8dc | `:refused`, exit 0: held L1 = 2, L2 = 3 registered at revision 6; release gave `succeeded 0` (server log: PUT 503); `/nodes/n4` at 8 on lease 3, mod_revision 6 |
+| `stale-register-control`, GCP | 190f8dc (0.5.2) + barrier patch | 190f8dc | *pending: GCP dispatch after merge* |
+| `stale-register-candidate`, GCP | 7d141a7 (#281) + barrier | 190f8dc | *pending: GCP dispatch after merge* |
+
+The local runs' summaries are `docs/stale-register/control-local.edn` and
+`docs/stale-register/candidate-local.edn`, copied from each run's
+`stale-register.edn`.
 
 The two stale-register rows get filled in from the GCP run, from its
 summary table and each test's `stale-register.edn`, for example its
@@ -28,13 +34,18 @@ agent had registered on L2 still committed, while L1 was live. That put
 under. The control run shows this on 0.5.2 itself.
 
 - How the PUT is held: by the barrier at the server, not by a proxy.
-- What the run shows: `done-n4-L1` should say `succeeded 1`, and `/nodes/n4`
-  at that revision should be on L1. The checker fails the run as
-  `:stale-registration-landed` and gives the reason.
+- What the run shows: `done-n4-L1` says `succeeded 1`, and `/nodes/n4`
+  at that revision is on L1. The checker fails the run as
+  `:stale-registration-landed` and gives the reason. Locally: L1 = 2 landed at
+  revision 9, over L2 = 3's tenure from revision 6. In an earlier local
+  control run the agent's next L2 keepalive was answered 503, and it granted
+  a new lease and registered again.
 
 The candidate shows the fix. The same sequence against 7d141a7, with the
-0.5.2 agent (which sends no `replaces`), should end with `succeeded 0`
-(503 ZC-E0205) and `/nodes/n4` still on L2 at its own tenure.
+0.5.2 agent (which sends no `replaces`), ends with `succeeded 0`
+(503 ZC-E0205) and `/nodes/n4` still on L2 at its own tenure (locally:
+lease 3, mod_revision 6). The GCP rows above confirm this on the real
+cluster once dispatched.
 
 ## (b) Run 44232537976's idle-node result came from older code
 
