@@ -11,7 +11,9 @@
 # Usage: control-run.sh "<test> <test> ..." <time-limit-seconds>
 # Tests: api-fenced api-unfenced api-negative-control api-unfenced-async,
 #        the same four for pg, lease-valid lease-wedged lease-late-kill,
-#        stale-put-running stale-put-registered stale-put-idle.
+#        stale-put-running stale-put-registered stale-put-idle,
+#        stale-register-candidate stale-register-control (their servers are
+#        the barrier builds under stale-register/, docs/stale-register.md).
 set -uo pipefail
 
 tests=${1:?tests}
@@ -66,6 +68,13 @@ args_for() {
       echo run -m zcube-jepsen.stale-put test "${common[@]}" --expect auto --release-after registered ;;
     stale-put-idle)
       echo run -m zcube-jepsen.stale-put test "${common[@]}" --expect auto --release-after registered --services 0 ;;
+    # The barrier servers gcp.yml's build job made from source (never the
+    # dist build); the control is meant to fail.
+    stale-register-candidate|stale-register-control)
+      local v=${t#stale-register-}
+      echo run -m zcube-jepsen.stale-register test --ssh-private-key "$key" \
+        --zcube-bin "$zc/stale-register/$v/bin" \
+        --zcube-images "$zc/stale-register/$v/images.zon" --label "$v" ;;
     *) return 1 ;;
   esac
 }

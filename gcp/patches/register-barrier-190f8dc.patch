@@ -1,0 +1,295 @@
+diff --git a/build.zig b/build.zig
+index 9680afc..7147353 100644
+--- a/build.zig
++++ b/build.zig
+@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
+     // Zigbox's package has a `build_options` module of its own; if the two files were byte for
+     // byte the same, the compiler would see one file in two modules. This line keeps them apart.
+     options.addOption([]const u8, "product", "zigcube");
++    options.addOption(bool, "register_barrier", register_barrier_option(b));
+ 
+     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+     const zigbox_module = zigbox.module("zigbox");
+@@ -194,6 +195,17 @@ const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
+ 
+ /// libpq's C header lives under /usr/include/postgresql on Debian and Ubuntu (libpq-dev);
+ /// `-Dpq-include=` names another directory. One option for the build's target and dist's.
++/// Test-only (#237): a zcube-server that holds a node's registration before its transaction when
++/// ZCUBE_TEST_REGISTER_BARRIER names a directory (server_register_barrier.zig), for the
++/// zigcube-jepsen stale-registration test. `dist` and `release` never set it.
++fn register_barrier_option(b: *std.Build) bool {
++    return b.option(
++        bool,
++        "register-barrier",
++        "Build zcube-server with the test-only registration barrier (default false)",
++    ) orelse false;
++}
++
+ fn pq_include_option(b: *std.Build) []const u8 {
+     return b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
+         "/usr/include/postgresql";
+@@ -453,6 +465,7 @@ fn shipped_options(
+     const options = b.addOptions();
+     options.addOption([]const u8, "version", version);
+     options.addOption([]const u8, "product", "zigcube");
++    options.addOption(bool, "register_barrier", false); // Never in a shipped binary.
+     return .{
+         .target = target,
+         .optimize = optimize,
+diff --git a/src/server.zig b/src/server.zig
+index 7b31bce..8a69265 100644
+--- a/src/server.zig
++++ b/src/server.zig
+@@ -38,12 +38,17 @@ const Diag = diag_mod.Diag;
+ /// (a cancel is not a failure to name), nothing is left open, and the caller stops quietly.
+ pub const Error = error{ StartFailed, OutOfMemory, Canceled };
+ 
++pub const Hook = http.Hook;
++
+ pub const Options = struct {
+     version: []const u8,
+     /// Print the controller's failures to stderr; tests that break the store turn it off.
+     report_failures: bool = true,
+     /// Log requests to stderr; tests turn it off.
+     log_requests: bool = true,
++    /// Test-only (#237): runs around every write before it takes the API's lock
++    /// (`server_http.Hook`, the registration barrier). Null in every shipped server.
++    hook: ?http.Hook = null,
+ };
+ 
+ pub const Server = struct {
+@@ -160,6 +165,7 @@ pub const Server = struct {
+                     .quiet = config.quiet,
+                     .silent = !options.log_requests,
+                 },
++                .hook = options.hook,
+             },
+             .driver = .{
+                 .gpa = gpa,
+diff --git a/src/server_http.zig b/src/server_http.zig
+index 80639f7..1b90ae1 100644
+--- a/src/server_http.zig
++++ b/src/server_http.zig
+@@ -76,6 +76,20 @@ pub const Tick = struct {
+     run: *const fn (context: *anyopaque) void,
+ };
+ 
++/// Test-only (#237): runs around a write, before it takes `api_mutex`
++/// (server_register_barrier.zig). `before` may block; `after` runs only when `before` answered
++/// true. No shipped server sets one: `zcube_server.zig` makes it only in a build with
++/// `-Dregister-barrier=true`.
++pub const Hook = struct {
++    context: *anyopaque,
++    before: *const fn (context: *anyopaque, request: api_mod.Request) bool,
++    after: *const fn (
++        context: *anyopaque,
++        request: api_mod.Request,
++        response: api_mod.Response,
++    ) void,
++};
++
+ /// Everything the connections share.
+ pub const Shared = struct {
+     gpa: Allocator,
+@@ -94,6 +108,8 @@ pub const Shared = struct {
+     tls_slots: u32 = constants.http_connections_max,
+     /// More work for each watchdog tick: the server's watch of its `revoked` file.
+     tick: ?Tick = null,
++    /// Test-only (#237): see `Hook`.
++    hook: ?Hook = null,
+ 
+     // ---- The connection table ----
+ 
+@@ -195,6 +211,18 @@ pub const Shared = struct {
+         request: api_mod.Request,
+     ) api_mod.Response {
+         if (is_read(request.method)) return shared.api.handle(ctx, request);
++        const hook = shared.hook orelse return shared.write(ctx, request);
++        if (!hook.before(hook.context, request)) return shared.write(ctx, request);
++        const response = shared.write(ctx, request);
++        hook.after(hook.context, request, response);
++        return response;
++    }
++
++    fn write(
++        shared: *Shared,
++        ctx: *const controller.Context,
++        request: api_mod.Request,
++    ) api_mod.Response {
+         shared.api_mutex.lockUncancelable(shared.io);
+         defer shared.api_mutex.unlock(shared.io);
+         return shared.api.handle(ctx, request);
+diff --git a/src/server_register_barrier.zig b/src/server_register_barrier.zig
+new file mode 100644
+index 0000000..453fcfe
+--- /dev/null
++++ b/src/server_register_barrier.zig
+@@ -0,0 +1,130 @@
++//! Test-only: a barrier in front of a node's registration request (#237, the zigcube-jepsen
++//! stale-registration test). Shell code: files and a sleep. `zcube-server` arms it only when
++//! built with `-Dregister-barrier=true` and run with `ZCUBE_TEST_REGISTER_BARRIER=DIR`; any other
++//! build ignores the variable and compiles none of this (`zcube_server.zig` imports it behind
++//! `build_options.register_barrier`, which `dist` and `release` set false). The unit tests reach
++//! it through `server_register_barrier_test.zig`.
++//!
++//! The protocol, all files in DIR:
++//! - The test creates `arm-<node>`. The next `PUT /v1/agent/nodes/<node>` removes it, creates
++//!   `held-<node>-<lease>`, and waits.
++//! - The test creates `release-<node>-<lease>`; the request then runs as it would have.
++//!   Without a release it runs after `wait_ms_max`, so a lost test cannot wedge a server.
++//! - The barrier writes `done-<node>-<lease>`: `succeeded <0|1> revision <N> at_ms <unix ms>`.
++//!
++//! The hold is before the server's write lock (`server_http.Shared.handle`) and before the API
++//! reads anything, so other writes go on while a registration is held, a newer registration of
++//! the node can land, and the held one, once released, meets the key on the newer lease and comes
++//! back refused (`succeeded 0`, ZC-E0205). Only the armed request waits.
++
++const std = @import("std");
++const assert = std.debug.assert;
++const api_mod = @import("api.zig");
++const http = @import("server_http.zig");
++const store = @import("store.zig");
++
++/// The longest a held registration waits for its release.
++pub const wait_ms_max: u64 = 300_000;
++const poll_ms: u64 = 10;
++const path_prefix = "/v1/agent/nodes/";
++
++pub const Barrier = struct {
++    io: std.Io,
++    /// The directory of the protocol's files; owned by the caller and outliving the server.
++    dir: []const u8,
++    wait_ms: u64 = wait_ms_max,
++
++    pub fn hook(barrier: *Barrier) http.Hook {
++        assert(barrier.dir.len > 0);
++        return .{ .context = barrier, .before = before, .after = after };
++    }
++
++    /// Holds the armed registration; true when it held this request.
++    fn before(context: *anyopaque, request: api_mod.Request) bool {
++        const barrier: *Barrier = @ptrCast(@alignCast(context));
++        const registration = registered(request) orelse return false;
++        if (!barrier.take_arm(registration.node)) return false;
++        barrier.hold(registration);
++        return true;
++    }
++
++    fn after(context: *anyopaque, request: api_mod.Request, response: api_mod.Response) void {
++        const barrier: *Barrier = @ptrCast(@alignCast(context));
++        const registration = registered(request) orelse return; // `before` held it.
++        const succeeded = response.status == 200;
++        const revision = if (succeeded) revision_of(response.body) else 0;
++        barrier.note(registration, "done", succeeded, revision);
++    }
++
++    const Registration = struct { node: []const u8, lease: store.LeaseId };
++
++    /// The node and lease of a `PUT /v1/agent/nodes/<node>`; null for any other request and for
++    /// a body without a lease (the API refuses that one itself).
++    fn registered(request: api_mod.Request) ?Registration {
++        if (!std.mem.eql(u8, request.method, "PUT")) return null;
++        if (!std.mem.startsWith(u8, request.path, path_prefix)) return null;
++        const node = request.path[path_prefix.len..];
++        if (node.len == 0 or std.mem.indexOfScalar(u8, node, '/') != null) return null;
++        var buffer: [4096]u8 = undefined;
++        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
++        const Body = struct { lease: store.LeaseId = store.lease_none };
++        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
++        const allocator = fixed.allocator();
++        const body = std.json.parseFromSliceLeaky(Body, allocator, request.body, options) catch
++            return null;
++        if (body.lease == store.lease_none) return null;
++        return .{ .node = node, .lease = body.lease };
++    }
++
++    fn revision_of(body: []const u8) store.Revision {
++        var buffer: [4096]u8 = undefined;
++        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
++        const Answer = struct { revision: store.Revision = 0 };
++        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
++        const answer = std.json.parseFromSliceLeaky(Answer, fixed.allocator(), body, options) catch
++            return 0;
++        return answer.revision;
++    }
++
++    fn take_arm(barrier: *Barrier, node: []const u8) bool {
++        var buffer: [std.fs.max_path_bytes]u8 = undefined;
++        const path = std.fmt.bufPrint(&buffer, "{s}/arm-{s}", .{ barrier.dir, node }) catch
++            return false;
++        std.Io.Dir.cwd().deleteFile(barrier.io, path) catch return false;
++        return true;
++    }
++
++    fn hold(barrier: *Barrier, registration: Registration) void {
++        barrier.note(registration, "held", false, 0);
++        var buffer: [std.fs.max_path_bytes]u8 = undefined;
++        const path = std.fmt.bufPrint(&buffer, "{s}/release-{s}-{d}", .{
++            barrier.dir, registration.node, registration.lease,
++        }) catch return;
++        var waited_ms: u64 = 0;
++        while (waited_ms < barrier.wait_ms) : (waited_ms += poll_ms) {
++            if (std.Io.Dir.cwd().access(barrier.io, path, .{})) |_| return else |_| {}
++            barrier.io.sleep(.fromMilliseconds(poll_ms), .awake) catch return;
++        }
++    }
++
++    /// Writes `<what>-<node>-<lease>`; a file that cannot be written is left out (the test then
++    /// times out, which is its failure to report).
++    fn note(
++        barrier: *Barrier,
++        registration: Registration,
++        what: []const u8,
++        succeeded: bool,
++        revision: store.Revision,
++    ) void {
++        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
++        const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}-{s}-{d}", .{
++            barrier.dir, what, registration.node, registration.lease,
++        }) catch return;
++        const at_ms = std.Io.Clock.real.now(barrier.io).toMilliseconds();
++        var data_buffer: [96]u8 = undefined;
++        const data = std.fmt.bufPrint(&data_buffer, "succeeded {d} revision {d} at_ms {d}\n", .{
++            @intFromBool(succeeded), revision, at_ms,
++        }) catch unreachable; // 96 bytes hold three numbers of at most 20 digits and the words.
++        std.Io.Dir.cwd().writeFile(barrier.io, .{ .sub_path = path, .data = data }) catch {};
++    }
++};
+diff --git a/src/zcube_server.zig b/src/zcube_server.zig
+index 9640a1a..1be0f43 100644
+--- a/src/zcube_server.zig
++++ b/src/zcube_server.zig
+@@ -120,6 +120,25 @@ fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
+     return say(init.io, line);
+ }
+ 
++/// Test-only (#237): the registration barrier (server_register_barrier.zig), compiled only in a
++/// server built with `-Dregister-barrier=true`; any other build ignores the variable.
++const RegisterBarrier = if (build_options.register_barrier)
++    @import("server_register_barrier.zig").Barrier
++else
++    void;
++var register_barrier_state: RegisterBarrier = undefined;
++
++/// The barrier's hook when it is built in and `ZCUBE_TEST_REGISTER_BARRIER` names a directory.
++fn register_barrier(init: std.process.Init, io: std.Io) ?server_mod.Hook {
++    if (build_options.register_barrier) {
++        const dir = init.environ_map.get("ZCUBE_TEST_REGISTER_BARRIER") orelse return null;
++        if (dir.len == 0) return null;
++        register_barrier_state = .{ .io = io, .dir = dir };
++        return register_barrier_state.hook();
++    }
++    return null;
++}
++
+ fn run(init: std.process.Init, config: config_mod.Config) u8 {
+     verbose_panics = config.verbose;
+     const limit = constants.http_connections_max + constants.http_refusals_max +
+@@ -131,6 +150,7 @@ fn run(init: std.process.Init, config: config_mod.Config) u8 {
+     diag.reset();
+     const server = server_mod.Server.start(init.gpa, io, config, .{
+         .version = build_options.version,
++        .hook = register_barrier(init, io),
+     }, &diag) catch |err| switch (err) {
+         error.OutOfMemory => return constants.exit_environment,
+         error.Canceled => return constants.exit_ok, // Stopped on request: nothing to report.

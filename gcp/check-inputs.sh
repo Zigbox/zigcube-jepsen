@@ -19,13 +19,15 @@ MARGIN=600
 known="api-fenced api-unfenced api-negative-control api-unfenced-async
 pg-fenced pg-unfenced pg-negative-control pg-unfenced-async
 lease-valid lease-wedged lease-late-kill
-stale-put-running stale-put-registered stale-put-idle"
+stale-put-running stale-put-registered stale-put-idle
+stale-register-candidate stale-register-control"
 
 fail() { echo "::error::$*" >&2; exit 1; }
 
 # Seconds of load a test takes for a given time_limit (control-run.sh's
 # args_for: the lease tests keep jepsen.yml's minimums; stale-put has its own
-# fixed phases, a few minutes at most).
+# fixed phases, a few minutes at most; stale-register's waits add up to about
+# two).
 load_seconds() {
   local t=$1 limit=$2
   case "$t" in
@@ -33,6 +35,7 @@ load_seconds() {
     lease-valid)     echo $(( limit > 200 ? limit : 200 )) ;;
     lease-*)         echo $(( limit > 120 ? limit : 120 )) ;;
     stale-put-*)     echo 180 ;;
+    stale-register-*) echo 120 ;;
   esac
 }
 
@@ -67,6 +70,7 @@ self_test() {
     "main|stale-put-running stale-put-idle|30"
     "refs/heads/j2-dist|lease-late-kill|1800"
     "v1.2.3|api-fenced api-fenced api-fenced|600"
+    "7d141a70c07181496c27543808bcc784b3b701dd|stale-register-candidate stale-register-control|120"
   )
   local bad=(
     "fb385b2|api-fenced; rm -rf /|120"
@@ -75,6 +79,7 @@ self_test() {
     "fb385b2|api-fenced|1801"
     "fb385b2|api-fenced|1e3"
     "fb385b2|api-fencedx|120"
+    "fb385b2|stale-register|120"
     "fb385b2||120"
     "-fb385b2|api-fenced|120"
     "refs/../x|api-fenced|120"
