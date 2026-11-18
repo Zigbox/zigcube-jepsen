@@ -15,6 +15,7 @@
             [zcube-jepsen.api :as api]
             [zcube-jepsen.core :as core]
             [zcube-jepsen.stale-put :as stale-put]
+            [zcube-jepsen.stale-register :as stale-register]
             [zcube-jepsen.zcube :as zcube])
   (:import (java.io File)
            (java.nio.file Files)
@@ -181,7 +182,9 @@
   (let [opts (defaults core/cli-opts)]
     {"api"       (core/register-test (assoc opts :workload "api"))
      "lease"     (core/lease-test (assoc opts :workload "lease" :expect :valid))
-     "stale-put" (stale-put/stale-put-test (defaults stale-put/cli-opts))}))
+     "stale-put" (stale-put/stale-put-test (defaults stale-put/cli-opts))
+     "stale-register" (stale-register/stale-register-test
+                        (defaults stale-register/cli-opts))}))
 
 (defn- fill!
   "The :zcube-tls of a B7+ run once the server node has set it up."

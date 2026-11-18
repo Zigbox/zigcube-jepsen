@@ -25,7 +25,8 @@ on:
       tests:
         description: >-
           Space-separated, run in order: {api,pg}-{fenced,unfenced,negative-control,unfenced-async},
-          lease-{valid,wedged,late-kill}, stale-put-{running,registered,idle}
+          lease-{valid,wedged,late-kill}, stale-put-{running,registered,idle},
+          stale-register-{candidate,control} (zigcube_ref must have the registration barrier)
         default: api-fenced pg-fenced lease-valid lease-wedged
       time_limit:
         description: Seconds of load and faults per register test (lease tests take at least their CI limits)
@@ -141,12 +142,18 @@ jobs:
     name: build Zigcube (no GCP access)
     needs: inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Up to three Zigcube builds: the ref, and for stale-register the two
+    # barrier servers (docs/stale-register.md).
+    timeout-minutes: 60
     # No id-token: this job runs the Zigcube ref's build.zig, which may be
     # anyone's code.
     permissions:
       contents: read
     env:
+      # stale-register's control: Zigcube 0.5.2, built with the barrier
+      # patched in (gcp/patches/register-barrier-190f8dc.patch). Its agent
+      # is the one both runs use.
+      STALE_REGISTER_CONTROL_REF: 190f8dcfa60a22da62d82ad8bac714cb64848c59
       ZIG_VERSION: "0.17.0"
       # From https://ziglang.org/download/index.json, 0.17.0 / x86_64-linux / shasum.
       ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
@@ -159,7 +166,26 @@ jobs:
           path: zigcube
           persist-credentials: false
 
+      # Only for the patch under gcp/patches; nothing here runs from it.
+      - name: Check out this repository
+        if: contains(inputs.tests, 'stale-register-')
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out Zigcube for the stale-register control
+        if: contains(inputs.tests, 'stale-register-')
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Zigbox/zigcube
+          ref: ${{ env.STALE_REGISTER_CONTROL_REF }}
+          path: zigcube-control
+          persist-credentials: false
+
       - name: Build Zigcube and pack the bundle
+        env:
+          STALE_REGISTER: ${{ contains(inputs.tests, 'stale-register-') }}
         run: |
           archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
@@ -181,6 +207,66 @@ jobs:
           if "$zig" build -l | grep -qE '^\s+dist\b'; then
             "$zig" build dist -Doptimize=ReleaseSafe -Dcpu=baseline
             mkdir -p "$b/dist" && cp -r zig-out/. "$b/dist/"
+          fi
+          # stale-register: zcube-server built with -Dregister-barrier=true,
+          # at the ref (candidate) and at 0.5.2 with the barrier patched in
+          # (control), both with 0.5.2's agent. Built here from source, each
+          # into its own prefix; never part of dist/ or bin/.
+          # docs/stale-register.md.
+          if [ "$STALE_REGISTER" = true ]; then
+            barrier=(-Doptimize=ReleaseSafe -Dcpu=baseline -Dregister-barrier=true)
+            sr="$b/stale-register"
+            # A ref without #281 (7d141a7) has no barrier option; say so
+            # here rather than as zig's "invalid option".
+            "$zig" build -h | grep -q -- '-Dregister-barrier' \
+              || { echo "::error::zigcube_ref $(git rev-parse HEAD) has no -Dregister-barrier (it needs Zigbox/zigcube#281)"; exit 1; }
+            "$zig" build "${barrier[@]}" -p "${RUNNER_TEMP}/sr-candidate"
+            (
+              cd ../zigcube-control
+              git apply --index ../harness/gcp/patches/register-barrier-190f8dc.patch
+              "$zig" build "${barrier[@]}" -p "${RUNNER_TEMP}/sr-control"
+            )
+            for v in candidate control; do
+              mkdir -p "$sr/$v/bin"
+              cp "${RUNNER_TEMP}/sr-$v/bin/zcube-server" "$sr/$v/bin/"
+              cp "${RUNNER_TEMP}/sr-control/bin/zcube-agent" "$sr/$v/bin/"
+            done
+            cp fixtures/images.zon "$sr/candidate/images.zon"
+            cp ../zigcube-control/fixtures/images.zon "$sr/control/images.zon"
+            git rev-parse HEAD > "$sr/candidate/COMMIT"
+            echo "$STALE_REGISTER_CONTROL_REF + gcp/patches/register-barrier-190f8dc.patch" > "$sr/control/COMMIT"
+            # The barrier reads this variable only when it is built in.
+            for f in "$sr"/*/bin/zcube-server; do
+              grep -q ZCUBE_TEST_REGISTER_BARRIER "$f" || { echo "::error::$f has no barrier"; exit 1; }
+            done
+            # And nothing shipped may have it: bin/, every file in dist/
+            # (loose binaries too), and every archive there, unpacked. An
+            # archive that does not unpack, or a dist/ with no archive,
+            # fails the step rather than passing it unchecked.
+            shipped="${RUNNER_TEMP}/shipped"
+            mkdir -p "$shipped" && cp "$b/bin/zcube-server" "$shipped/"
+            if [ -d "$b/dist" ]; then
+              n=0
+              while IFS= read -r -d '' a; do
+                d="$shipped/archive-$n"; mkdir -p "$d"
+                case "$a" in
+                  *.tar.gz|*.tgz) tar -xzf "$a" -C "$d" ;;
+                  *.tar.xz) tar -xJf "$a" -C "$d" ;;
+                  *.tar.zst) tar --zstd -xf "$a" -C "$d" ;;
+                  *.zip) unzip -q "$a" -d "$d" ;;
+                esac || { echo "::error::cannot unpack $a"; exit 1; }
+                n=$((n + 1))
+              done < <(find "$b/dist" -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar.xz' \
+                         -o -name '*.tar.zst' -o -name '*.zip' \) -print0)
+              [ "$n" -gt 0 ] || { echo "::error::dist/ has no archive to check"; exit 1; }
+              echo "stale-register: checked bin/, dist/ and $n archive(s) for the barrier"
+            fi
+            scan=("$shipped" "$b/bin")
+            [ -d "$b/dist" ] && scan+=("$b/dist")
+            if grep -rlq ZCUBE_TEST_REGISTER_BARRIER "${scan[@]}"; then
+              echo "::error::a shipped build has the barrier: $(grep -rl ZCUBE_TEST_REGISTER_BARRIER "${scan[@]}")"; exit 1
+            fi
+            echo "stale-register: candidate $(cat "$sr/candidate/COMMIT"), control $(cat "$sr/control/COMMIT")" >> "$GITHUB_STEP_SUMMARY"
           fi
           tar -czf "${RUNNER_TEMP}/out/zigcube.tar.gz" -C "$b" .
           find "$b" -type f -printf '%s\t%p\n' | head -40
@@ -281,9 +367,9 @@ jobs:
           gcp/ci.sh fetch && rc=0 || rc=$?
           if [ -f "$RESULTS/out/summary.tsv" ]; then
             {
-              echo '| test | exit | seconds | store |'
-              echo '|---|---|---|---|'
-              tail -n +2 "$RESULTS/out/summary.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" |"}'
+              echo '| test | exit | outcome | seconds | store |'
+              echo '|---|---|---|---|---|'
+              tail -n +2 "$RESULTS/out/summary.tsv" | awk -F'\t' '{print "| "$1" | "$2" | "$3" | "$4" | "$5" |"}'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           for f in "$RESULTS"/out/logs/*.log; do

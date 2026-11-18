@@ -10,7 +10,9 @@ Leiningen are allowed here, not there).
 register test through `zcube-server`'s API under partitions and Postgres
 failover, and a lease test (I1a, the I1b overlap measured on the agents, the
 fencing inequality) with a wedged-agent negative control, and the stale
-registration PUT of #237 as an expected-failure test (`docs/stale-put.md`). What the test does not yet do is listed under
+registration PUT of #237 as an expected-failure test (`docs/stale-put.md`),
+and its refusal (#281) checked at the real mTLS server through Zigcube's
+test-only registration barrier (`docs/stale-register.md`). What the test does not yet do is listed under
 [What is not covered yet](#what-is-not-covered-yet).
 
 ## What runs
@@ -269,7 +271,9 @@ lease tests' own pins are `fb385b2` for `lease-valid`/`lease-wedged` and
 another on the same cluster: `api-` and `pg-` with `fenced`, `unfenced`,
 `negative-control`, `unfenced-async`; `lease-valid`, `lease-wedged`,
 `lease-late-kill`; `stale-put-running`, `stale-put-registered`,
-`stale-put-idle`), `time_limit` (seconds of load per register test, 30 to
+`stale-put-idle`; `stale-register-candidate`, `stale-register-control`,
+whose barrier servers the build job makes from source, never in dist:
+`docs/stale-register.md`), `time_limit` (seconds of load per register test, 30 to
 1800; the lease tests take at least their `jepsen.yml` limits, 200 and 120).
 Each test gets the same arguments as its `jepsen.yml` / `stale-put.yml` job.
 The `check the inputs` job refuses unknown tests, malformed values, and a
@@ -436,6 +440,10 @@ plain-HTTP PUT, so it cannot sit inside mTLS. Against a B7+ server,
 stale-put fails at setup with a message that says so. It still runs at its
 own pinned (pre-B7) commit.
 
+**stale-register needs no proxy.** It holds the registration inside the
+server, with Zigcube's test-only barrier (`-Dregister-barrier=true`), and
+talks mTLS end to end (`docs/stale-register.md`).
+
 ## What is not covered yet
 
 - **No compare-and-set through the API**, because the API has none. A plain
@@ -472,6 +480,7 @@ src/zcube_jepsen/nemesis.clj    partitions that include the control host
 src/zcube_jepsen/checkers.clj   Elle versioned register, outage, sanity, verdict
 src/zcube_jepsen/lease.clj      lease workload: recorder, watch, faults, collect
 src/zcube_jepsen/lease_checkers.clj  fencing, I1a, I1b, lease verdict
+src/zcube_jepsen/stale_register.clj  #237 refusal through the server's registration barrier
 test/                           checker unit tests
 docker/                         node image, up/down, fault probe
 tofu/                           the GCP cluster (OpenTofu): VPC, NAT, IAP SSH, VMs

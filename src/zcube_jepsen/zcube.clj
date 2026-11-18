@@ -310,11 +310,14 @@
    (reset! (tls-atom test) state)))
 
 (defn start-server!
-  "`tls?`: the binary serves mTLS on --listen (`tls-capable?`)."
+  "`tls?`: the binary serves mTLS on --listen (`tls-capable?`). The test's
+  :zcube-server-env, a map of names to values, is the server's environment
+  (stale-register's barrier directory); keys never go there."
   [test tls?]
   (c/su
     (apply cu/start-daemon!
-      {:logfile server-log :pidfile server-pid :chdir dir}
+      (cond-> {:logfile server-log :pidfile server-pid :chdir dir}
+        (seq (:zcube-server-env test)) (assoc :env (:zcube-server-env test)))
       (str dir "/zcube-server")
       (concat
         [:--listen (str "0.0.0.0:" port)]

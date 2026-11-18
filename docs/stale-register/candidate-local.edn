@@ -1,0 +1,168 @@
+{:l1 2,
+ :done
+ {:succeeded false,
+  :revision 0,
+  :at-ms 1795022610246,
+  :lease 2,
+  :server-revision-after 8},
+ :valid? true,
+ :l2-tenure 6,
+ :l1-live-until 1795022619480,
+ :nodes-at
+ {:status 200,
+  :revision 8,
+  :truncated false,
+  :node {:lease 3, :mod-revision 6},
+  :state "ready",
+  :at 8},
+ :why
+ "the registration on L1 (2) was refused (succeeded 0); at revision 8 /nodes/<node> is still on L2 (3) at its tenure 6",
+ :in-time true,
+ :steps
+ [{:time 63636459, :type :info, :f :start-agent, :value nil}
+  {:time 139000291,
+   :type :info,
+   :f :start-agent,
+   :value {:node "n4", :at 1795022598584}}
+  {:time 139091391, :type :info, :f :await-registered, :value nil}
+  {:time 351752227,
+   :type :info,
+   :f :await-registered,
+   :value {:lease 1, :mod-revision 1, :revision 2, :at 1795022598867}}
+  {:time 351825679, :type :info, :f :kill-agent, :value nil}
+  {:time 374782550, :type :info, :f :kill-agent, :value "n4"}
+  {:time 375016317, :type :info, :f :await-expired, :value nil}
+  {:time 10948293860,
+   :type :info,
+   :f :await-expired,
+   :value {:revision 5, :at 1795022609464}}
+  {:time 10948424138, :type :info, :f :arm, :value nil}
+  {:time 10961721994, :type :info, :f :arm, :value "arm-n4"}
+  {:time 10961815467, :type :info, :f :start-agent, :value nil}
+  {:time 11035510235,
+   :type :info,
+   :f :start-agent,
+   :value {:node "n4", :at 1795022609480}}
+  {:time 11035573834, :type :info, :f :await-held, :value nil}
+  {:time 11319758102,
+   :type :info,
+   :f :await-held,
+   :value
+   {:lease 2,
+    :agent-started 1795022609480,
+    :held "succeeded 0 revision 0 at_ms 1795022609647"}}
+  {:time 11319855245, :type :info, :f :kill-agent, :value nil}
+  {:time 11334805654, :type :info, :f :kill-agent, :value "n4"}
+  {:time 11334876236, :type :info, :f :forget-lease, :value nil}
+  {:time 11390090630,
+   :type :info,
+   :f :forget-lease,
+   :value "lease.json"}
+  {:time 11390170933, :type :info, :f :start-agent, :value nil}
+  {:time 11499693704,
+   :type :info,
+   :f :start-agent,
+   :value {:node "n4", :at 1795022609907}}
+  {:time 11499770418, :type :info, :f :await-registered, :value nil}
+  {:time 11713634912,
+   :type :info,
+   :f :await-registered,
+   :value {:lease 3, :mod-revision 6, :revision 8, :at 1795022610230}}
+  {:time 11713807656, :type :info, :f :release, :value nil}
+  {:time 11730753026,
+   :type :info,
+   :f :release,
+   :value {:lease 2, :at 1795022610231}}
+  {:time 11730849701, :type :info, :f :await-done, :value nil}
+  {:time 11796055436,
+   :type :info,
+   :f :await-done,
+   :value
+   {:succeeded false,
+    :revision 0,
+    :at-ms 1795022610246,
+    :lease 2,
+    :server-revision-after 8}}
+  {:time 11796162102, :type :info, :f :read-nodes, :value nil}
+  {:time 11801594171,
+   :type :info,
+   :f :read-nodes,
+   :value
+   {:status 200,
+    :revision 8,
+    :truncated false,
+    :node {:lease 3, :mod-revision 6},
+    :state "ready",
+    :at 8}}],
+ :stale-registrations [],
+ :failed-steps [],
+ :l0 1,
+ :store-rows
+ [{:rev 1,
+   :idx 0,
+   :key "/nodes/n4",
+   :deleted false,
+   :lease 1,
+   :value
+   {:v 1,
+    :name "n4",
+    :agent_version "0.5.2",
+    :address "",
+    :capacity {:cpu_millis 4000, :memory_bytes 8589934592},
+    :labels [],
+    :trust_policy ""}}
+  {:rev 2,
+   :idx 3,
+   :key "/node-status/n4",
+   :deleted false,
+   :lease 0,
+   :value
+   {:v 1,
+    :state "ready",
+    :tenure 1,
+    :at_ms 1795022598802,
+    :decision "1795022598802-5c34-0000"}}
+  {:rev 4,
+   :idx 1,
+   :key "/nodes/n4",
+   :deleted true,
+   :lease 1,
+   :value nil}
+  {:rev 5,
+   :idx 3,
+   :key "/node-status/n4",
+   :deleted false,
+   :lease 0,
+   :value
+   {:v 1,
+    :state "lost",
+    :tenure 1,
+    :at_ms 1795022609391,
+    :decision "1795022609391-5c34-0001"}}
+  {:rev 6,
+   :idx 0,
+   :key "/nodes/n4",
+   :deleted false,
+   :lease 3,
+   :value
+   {:v 1,
+    :name "n4",
+    :agent_version "0.5.2",
+    :address "",
+    :capacity {:cpu_millis 4000, :memory_bytes 8589934592},
+    :labels [],
+    :trust_policy ""}}
+  {:rev 7,
+   :idx 3,
+   :key "/node-status/n4",
+   :deleted false,
+   :lease 0,
+   :value
+   {:v 1,
+    :state "ready",
+    :tenure 6,
+    :at_ms 1795022610115,
+    :decision "1795022610114-5c34-0002"}}],
+ :outcome :refused,
+ :l2 3,
+ :store-collected true}
