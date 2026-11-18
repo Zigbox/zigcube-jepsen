@@ -43,7 +43,8 @@
 
   Each verdict is proved from evidence, never from its absence. The run is
   :vacuous (it did not set up #237's race) unless all of these hold: every
-  step happened; the run used mTLS; held-n4-L1 was written (the hold was
+  step happened; the run used mTLS (the :collect step
+  records the mode while the db is up); held-n4-L1 was written (the hold was
   reached); L0 < L1 < L2; done-n4-L1 holds its succeeded flag; done came at
   or after the release (less a clock margin); a PUT that succeeded committed
   above L2's tenure; done came a margin before L1's earliest end (the
@@ -348,7 +349,11 @@
               {:for-ms ms :changes seen :last (peek seen)}))))
 
       :collect
-      {:store (stale-put/read-store test)
+      ; :tls? is read here, while the db is up: Jepsen tears the db down
+      ; (zcube/teardown-tls! empties :zcube-tls) before the checker runs, so
+      ; the checker must take the mode from the history, not the test map.
+      {:tls? (zcube/tls? test)
+       :store (stale-put/read-store test)
        :server-log (server-put-lines test n)
        :end (now-ms)})))
 
@@ -457,6 +462,8 @@
                               (select-keys r [:rev :key :lease])))
      :stale-registrations (vec (filter #(= k (:key %)) (stale-put/stale-registrations rows)))
      :store-collected (map? col)
+     ; Recorded by :collect during the run; nil (so :vacuous) when it is not.
+     :tls? (when (map? col) (:tls? col))
      :rows rows}))
 
 (defn- live? [leases id]
@@ -541,7 +548,7 @@
 
 (defn judge
   "{:valid? :outcome :expected :why :finding-a :finding-b} from analyse's
-  map (with :tls?) and the expected outcome: :refused (a server with #281)
+  map (its :tls? as :collect recorded it) and the expected outcome: :refused (a server with #281)
   or :stale-registration-landed (the 0.5.2 control)."
   ([a] (judge a :refused))
   ([a expect]
@@ -573,8 +580,7 @@
 (defn checker [expect]
   (reify checker/Checker
     (check [_ test history _opts]
-      (let [a (assoc (analyse history (held-node test) (:lease-ttl-ms test))
-                     :tls? (try (zcube/tls? test) (catch Exception _ nil)))
+      (let [a (analyse history (held-node test) (:lease-ttl-ms test))
             j (judge a expect)
             summary (merge j (dissoc a :rows))]
         (info "stale-register:" (pr-str (select-keys j [:valid? :outcome :expected :why])))

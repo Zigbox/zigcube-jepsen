@@ -1,5 +1,7 @@
 (ns zcube-jepsen.stale-register-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [zcube-jepsen.stale-register :as sr]))
 
 (deftest parse-done-test
@@ -50,10 +52,11 @@
 (defn- history
   "A run's steps: L0 = 3, L1 = 4, L2 = 5 (tenure 9); held at 1001000, released
   at 1004000. `done` and `read` are what the barrier and GET /v1/nodes?at=N
-  gave; `rows` the store's /nodes/n4 puts; `log` the server's PUT lines."
-  [{:keys [done read rows started log leases l1 l0 release-at]
+  gave; `rows` the store's /nodes/n4 puts; `log` the server's PUT lines;
+  `tls` the mode :collect recorded (:absent: none, as before the fix)."
+  [{:keys [done read rows started log leases l1 l0 release-at tls]
     :or {started 1000000 log [refused-line] leases live-leases l1 4 l0 3
-         release-at 1004000}}]
+         release-at 1004000 tls true}}]
   [(op :start-agent {:node "n4" :at 990000})
    (op :await-registered {:lease l0 :mod-revision 2 :revision 3 :at 995000})
    (op :kill-agent "n4")
@@ -70,13 +73,14 @@
    (op :await-done (if (map? done) (assoc done :leases leases) done))
    (op :read-nodes read)
    (op :observe-after {:for-ms 16000 :changes [] :last nil})
-   (op :collect {:store {:rows rows :compacted 0} :server-log log :end 1030000})])
+   (op :collect (cond-> {:store {:rows rows :compacted 0} :server-log log :end 1030000}
+                  (not= :absent tls) (assoc :tls? tls)))])
 
 (defn- put [rev lease] {:rev rev :idx 0 :key "/nodes/n4" :deleted false :lease lease})
 
 (defn- judged
   ([h] (judged h :refused))
-  ([h expect] (sr/judge (assoc (sr/analyse h "n4" ttl) :tls? true) expect)))
+  ([h expect] (sr/judge (sr/analyse h "n4" ttl) expect)))
 
 (def refused {:succeeded false :revision 0 :at-ms 1004100 :lease 4})
 (def l2-read {:status 200 :revision 12 :truncated false :at 12
@@ -95,8 +99,7 @@
 (deftest invocations-are-skipped
   (testing "each step's invocation (value nil) before its completion, as Jepsen records them"
     (let [h (history {:done refused :read l2-read :rows [(put 2 3) (put 9 5)]})
-          j (sr/judge (assoc (sr/analyse (mapcat (fn [o] [(assoc o :value nil) o]) h) "n4" ttl)
-                             :tls? true))]
+          j (sr/judge (sr/analyse (mapcat (fn [o] [(assoc o :value nil) o]) h) "n4" ttl))]
       (is (= :refused (:outcome j)) (pr-str j)))))
 
 (deftest control-lands-and-says-so
@@ -160,12 +163,12 @@
     (let [j (judged (history {:done refused :read l2-read :l1 3
                               :rows [(put 2 3) (put 9 5)]}))]
       (is (= :vacuous (:outcome j)) (pr-str j))))
-  (testing "not over mTLS"
-    (let [j (sr/judge (assoc (sr/analyse (history {:done refused :read l2-read
-                                                   :rows [(put 2 3) (put 9 5)]})
-                                         "n4" ttl)
-                             :tls? false))]
-      (is (= :vacuous (:outcome j)) (pr-str j)))))
+  (testing "not over mTLS, or the mode not recorded during the run"
+    (doseq [tls [false nil :absent]]
+      (let [j (judged (history {:done refused :read l2-read :tls tls
+                                :rows [(put 2 3) (put 9 5)]}))]
+        (is (= :vacuous (:outcome j)) (pr-str tls))
+        (is (= "the run did not use mTLS" (:why j)) (pr-str tls))))))
 
 (deftest refused-but-moved-is-not-a-pass
   (testing "succeeded 0, yet the store shows a put on L1 after L2"
@@ -200,3 +203,48 @@
     (let [j (judged (history {:done refused :read (assoc l2-read :truncated true)
                               :rows [(put 2 3) (put 9 5)]}))]
       (is (= :vacuous (:outcome j))))))
+
+;; ---------------------------------------------------------------- GCP, run 44374779908
+
+(defn- gcp-history
+  "The nemesis ops of GCP run 44374779908 (Zigcube 7d141a7, ttl 10000), as
+  its history.edn holds them. Its :collect has no :tls?: the checker of
+  beb1583 read the mode from the test map after Jepsen's db teardown had
+  emptied it, and judged both runs :vacuous \"the run did not use mTLS\"."
+  [t]
+  (with-open [r (java.io.PushbackReader.
+                  (io/reader (io/file "test/fixtures/stale-register"
+                                      (str "gcp-44374779908-" t "-history.edn"))))]
+    (vec (take-while some? (repeatedly #(edn/read {:eof nil} r))))))
+
+(defn- with-collected-tls
+  "The history as this harness records it now: :collect holds the mode (the
+  run's server log said \"zcube-server speaks mTLS on --listen\")."
+  [h]
+  (mapv #(if (and (= :collect (:f %)) (map? (:value %))) (assoc-in % [:value :tls?] true) %) h))
+
+(deftest gcp-run-44374779908
+  (testing "as recorded then: no mode in the history, so still :vacuous, never assumed"
+    (doseq [[t e] [["candidate" :refused] ["control" :stale-registration-landed]]]
+      (let [j (judged (gcp-history t) e)]
+        (is (= :vacuous (:outcome j)) t)
+        (is (= "the run did not use mTLS" (:why j)) t))))
+  (testing "the candidate, with the mode recorded: refused"
+    (let [a (sr/analyse (with-collected-tls (gcp-history "candidate")) "n4" ttl)
+          j (sr/judge a :refused)]
+      (is (= [1 2 3 6] [(:l0 a) (:l1 a) (:l2 a) (:l2-tenure a)]))
+      (is (= {:succeeded false :revision 0 :at-ms 1795029420504} (:done a)))
+      (is (= 503 (-> a :released-put-log :status)))
+      (is (:valid? j) (pr-str (select-keys j [:outcome :why])))
+      (is (= :refused (:outcome j)))
+      (is (= :l2-at-tenure (-> j :finding-b :at-n :on)))))
+  (testing "the control, with the mode recorded: the stale registration landed"
+    (let [a (sr/analyse (with-collected-tls (gcp-history "control")) "n4" ttl)
+          j (sr/judge a :stale-registration-landed)]
+      (is (= {:succeeded true :revision 9 :at-ms 1795029475154} (:done a)))
+      (is (:valid? j) (pr-str (select-keys j [:outcome :why])))
+      (is (= :stale-registration-landed (:outcome j)))
+      (is (= :l1 (-> j :finding-b :at-n :on)))
+      ; Lease 4 afterwards: the L2 agent fenced itself (ZC-W0501) and
+      ; registered again; observed in finding (b), not judged.
+      (is (= {:lease 4 :mod-revision 11} (-> j :finding-b :after :last :node))))))

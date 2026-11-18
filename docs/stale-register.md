@@ -73,7 +73,10 @@ that was never reached never reads as a refusal.
 **`:vacuous`**: the run did not set up #237's race. Any of these:
 
 - A step ran out of time or threw.
-- The run did not use mTLS (the test forces `:zcube-tls-mode :on`).
+- The run did not use mTLS (the test forces `:zcube-tls-mode :on`). The
+  `:collect` step records the mode in the history while the db is up;
+  Jepsen tears the db down, emptying it in the test map, before the checker
+  runs.
 - `held-n4-L1` was never written, so the hold was not reached.
 - Not L0 < L1 < L2, or L2's tenure (its registration's mod_revision) is
   unknown.
